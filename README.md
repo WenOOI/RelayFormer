@@ -28,34 +28,27 @@ All videos are directly playable below.
 <table>
   <tr>
     <td align="center">
-      <video src="assets/blackswan.mp4" controls autoplay loop muted style="width:100%; max-width:320px;"></video>
-      <br>Demo 1
+      <img src="assets/blackswan.gif" width="320"><br>Demo 1
     </td>
     <td align="center">
-      <video src="assets/breakdance-flare.mp4" controls autoplay loop muted style="width:100%; max-width:320px;"></video>
-      <br>Demo 2
+      <img src="assets/breakdance-flare.mp4" width="320"><br>Demo 2
     </td>
     <td align="center">
-      <video src="breakdance.mp4" controls autoplay loop muted style="width:100%; max-width:320px;"></video>
-      <br>Demo 3
+      <img src="assets/breakdance.mp4" width="320"><br>Demo 3
     </td>
   </tr>
   <tr>
     <td align="center">
-      <video src="elephant.mp4" controls autoplay loop muted style="width:100%; max-width:320px;"></video>
-      <br>Demo 4
+      <img src="assets/elephant.mp4" width="320"><br>Demo 4
     </td>
     <td align="center">
-      <video src="motocross-jump.mp4" controls autoplay loop muted style="width:100%; max-width:320px;"></video>
-      <br>Demo 5
+      <img src="assets/motocross-jump.mp4" width="320"><br>Demo 5
     </td>
     <td align="center">
-      <video src="assets/dance-twirl.mp4" controls autoplay loop muted style="width:100%; max-width:320px;"></video>
-      <br>Demo 6
+      <img src="assets/dance-twirl.mp4" width="320"><br>Demo 6
     </td>
   </tr>
 </table>
-
 
 
 ## 📅 Roadmap / TODO

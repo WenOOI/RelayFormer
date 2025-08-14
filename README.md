@@ -31,21 +31,21 @@ All videos are directly playable below.
       <img src="assets/blackswan.gif" width="320"><br>Demo 1
     </td>
     <td align="center">
-      <img src="assets/breakdance-flare.mp4" width="320"><br>Demo 2
+      <img src="assets/breakdance-flare.gif" width="320"><br>Demo 2
     </td>
     <td align="center">
-      <img src="assets/breakdance.mp4" width="320"><br>Demo 3
+      <img src="assets/breakdance.gif" width="320"><br>Demo 3
     </td>
   </tr>
   <tr>
     <td align="center">
-      <img src="assets/elephant.mp4" width="320"><br>Demo 4
+      <img src="assets/elephant.gif" width="320"><br>Demo 4
     </td>
     <td align="center">
-      <img src="assets/motocross-jump.mp4" width="320"><br>Demo 5
+      <img src="assets/motocross-jump.gif" width="320"><br>Demo 5
     </td>
     <td align="center">
-      <img src="assets/dance-twirl.mp4" width="320"><br>Demo 6
+      <img src="assets/dance-twirl.gif" width="320"><br>Demo 6
     </td>
   </tr>
 </table>

@@ -22,8 +22,8 @@ RelayFormer is a modular architecture designed for detecting manipulated regions
 
 ### Video Results
 
-Here are qualitative results of RelayFormer on manipulated videos.  
-All videos are directly playable below.
+Here are qualitative results of RelayFormer on manipulated videos, where specific objects have been removed from the original footage.
+The red mask regions indicate the areas predicted by the model as having been removed or altered from the original content.
 
 <table>
   <tr>

@@ -16,7 +16,7 @@ Official PyTorch implementation of our paper:
 ## 📌 Introduction
 RelayFormer is a modular architecture designed for detecting manipulated regions in both images and videos at dynamic resolution.
 
-
+![Overview](./assets/overview.png)
 
 
 ---

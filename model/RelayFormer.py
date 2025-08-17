@@ -5,8 +5,7 @@ import timm
 import numpy as np
 from PIL import Image
 
-# Assuming DecAttention is defined in global_vit module
-from GLoRA_vit import DecAttention
+from GLoRA_vit import DecAttention, replace_vit_modules
 
 def to_NCHW(x, h=None, w=None):
     """
@@ -138,7 +137,7 @@ class RelayFormer(nn.Module):
     """
     RelayFormer model for processing images by dividing them into patches and generating masks.
     """
-    def __init__(self, input_size=1024, vit_model_name='global_vit_base_patch16_224', 
+    def __init__(self, input_size=1024, vit_model_name='vit_base_patch16_224', 
                  tokens_per_patch=2, patch_size=528, overlap=16, 
                  feature_patch_size=33, feature_overlap=1):
         """
@@ -146,7 +145,7 @@ class RelayFormer(nn.Module):
 
         Args:
             input_size (int): Input image size (default: 1024).
-            vit_model_name (str): Name of the Vision Transformer model (default: 'global_vit_base_patch16_224').
+            vit_model_name (str): Name of the Vision Transformer model (default: 'vit_base_patch16_224').
             tokens_per_patch (int): Number of tokens per patch (default: 2).
             patch_size (int): Size of image patches (default: 528).
             overlap (int): Overlap pixels for image patches (default: 16).
@@ -167,10 +166,11 @@ class RelayFormer(nn.Module):
         self.stride = self.patch_size - self.overlap * 2
         self.feature_stride = self.feature_patch_size - self.feature_overlap * 2
 
-        # Load pretrained Vision Transformer
-        self.vit = timm.create_model(vit_model_name, num_classes=0, reg_tokens=1, 
+        # create Vision Transformer
+        vit = timm.create_model(vit_model_name, num_classes=0, reg_tokens=1, 
                                     drop_path_rate=0.1, dynamic_img_size=True, 
                                     no_embed_class=False)
+        self.vit = replace_vit_modules(vit)
         self.feature_dim = self.vit.num_features
 
         self.tpp = tokens_per_patch
@@ -466,14 +466,9 @@ class RelayFormer(nn.Module):
         valid_patches_list, max_valid_patches, grid_hw_list = self.get_valid_patches_info(
             origin_shape, self.input_size, grid_size, clip_len=clip_len)
         patches = self.select_valid_patches(valid_patches_list, patches)
-
         features, feature_list = self.forward_features(patches, valid_patches_list, 
                                                      grid_hw_list, clip_len_list=clip_len)
-
         pred_mask = self.assemble_and_decode(features[:, self.tpp:], image, 
                                             valid_patches_list, grid_hw_list, grid_size)
-
         mask_pred = torch.sigmoid(pred_mask)
-        output_dict = {"pred_mask": mask_pred}
-        
-        return output_dict
+        return mask_pred

@@ -14,7 +14,10 @@ Official PyTorch implementation of our paper:
 ---
 
 ## 📌 Introduction
-RelayFormer is a modular architecture designed for detecting manipulated regions in both images and videos at dynamic resolution. It achieves **state-of-the-art accuracy** with high computational efficiency.
+RelayFormer is a modular architecture designed for detecting manipulated regions in both images and videos at dynamic resolution.
+
+
+
 
 ---
 

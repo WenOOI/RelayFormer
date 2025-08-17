@@ -75,7 +75,9 @@ pip install rotary_embedding_torch
 ### 0. Download Pre-trained Weights
 
 
-You can download the pre-trained weights [here](https://drive.google.com/file/d/1CFxwkVAB6_Qq-A8VJlYXJdcABJ26r7xJ/view?usp=drive_link). These weights were trained on the CASIAv2.0 dataset for images and the DAVIS2016 inpainting dataset for videos, enabling the model to handle arbitrary image and video inputs. The weights were trained on these datasets to facilitate validation of the results presented in the paper. In the paper, the two modalities were trained independently to ensure a fair comparison and avoid cross-task interference. However, experiments indicate that mixed training with both modalities has minimal impact on performance. In the future, we plan to release weights trained on a larger, combined dataset for direct application.
+You can download the pre-trained weights [here](https://drive.google.com/file/d/1CFxwkVAB6_Qq-A8VJlYXJdcABJ26r7xJ/view?usp=drive_link). These weights were trained on the CASIAv2.0 dataset for images and the DAVIS2016 inpainting dataset for videos, enabling the model to handle arbitrary image and video inputs. The weights were trained on these datasets to facilitate validation of the results presented in the paper. In the paper, the two modalities were trained independently to ensure a fair comparison and avoid cross-task interference. However, experiments indicate that mixed training with both modalities has minimal impact on performance. 
+
+In the future, we plan to release weights trained on a larger, combined dataset for real-world application.
 
 
 ### 1. Inference

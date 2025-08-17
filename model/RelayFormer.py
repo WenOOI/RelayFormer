@@ -5,7 +5,7 @@ import timm
 import numpy as np
 from PIL import Image
 
-from GLoRA_vit import DecAttention, replace_vit_modules
+from .GLoRA_vit import DecAttention, replace_vit_modules
 
 def to_NCHW(x, h=None, w=None):
     """

@@ -56,8 +56,8 @@ The red mask regions indicate the areas predicted by the model as having been re
 
 ## 📅 Roadmap / TODO
 
-* [x] **Release pretrained weights** (Relay-ViT)
-* [x] **Publish inference code** with sample scripts & demo
+* ✅ **Release pretrained weights** (Relay-ViT) 
+* ✅ **Publish inference code** with sample scripts & demo
 * [ ] **Publish training code** with full configurations
 * [ ] Add documentation for datasets & evaluation
 

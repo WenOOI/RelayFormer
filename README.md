@@ -116,7 +116,7 @@ If you use RelayFormer in your research, please cite:
 ```bibtex
 @article{huang2025relayformer,
   title={RelayFormer: A Unified Local-Global Attention Framework for Scalable Image and Video Manipulation Localization},
-  author={Huang, Wen and Yang, Jiarui and Dai, Tao and others},
+  author={Huang, Wen and Yang, Jiarui and Dai, Tao and Li, Jiawei and Zhan, Shaoxiong and Wang, Bin and Xia, Shu-Tao},
   journal={arXiv preprint arXiv:2508.09459},
   year={2025}
 }

@@ -67,6 +67,10 @@ The red mask regions indicate the areas predicted by the model as having been re
 ```bash
 git clone https://github.com/WenOOI/RelayFormer.git
 cd RelayFormer
+
+conda create -n vml python=3.9
+conda activate vml
+
 pip install imdlbenco
 pip install rotary_embedding_torch
 ```
@@ -77,10 +81,15 @@ pip install rotary_embedding_torch
 
 ### 0. Download Pre-trained Weights
 
+#### 0.1 Weights from the paper
+You can download the pre-trained weights used in the paper [here](https://drive.google.com/file/d/1CFxwkVAB6_Qq-A8VJlYXJdcABJ26r7xJ/view?usp=drive_link). These weights were trained on the CASIAv2.0 dataset for images and the DAVIS2016 inpainting dataset for videos, allowing the model to handle arbitrary image and video inputs.  
 
-You can download the pre-trained weights [here](https://drive.google.com/file/d/1CFxwkVAB6_Qq-A8VJlYXJdcABJ26r7xJ/view?usp=drive_link). These weights were trained on the CASIAv2.0 dataset for images and the DAVIS2016 inpainting dataset for videos, enabling the model to handle arbitrary image and video inputs. The weights were trained on these datasets to facilitate validation of the results presented in the paper. In the paper, the two modalities were trained independently to ensure a fair comparison and avoid cross-task interference. However, experiments indicate that mixed training with both modalities has minimal impact on performance. 
+In the original experiments, the two modalities were trained independently to ensure a fair comparison and prevent cross-task interference. However, further tests indicate that joint training of both modalities has minimal impact on performance. These weights are intended primarily for reproducing the results reported in the paper.
 
-In the future, we plan to release weights trained on a larger, combined dataset for real-world applications.
+#### 0.2 Application-oriented weights
+You can download the application-oriented weights [here](https://drive.google.com/file/d/1vLIxt_2xdGoI2voFMOFKsHCpU7EZG3qE/view?usp=sharing).  
+
+These weights are trained on a larger, more diverse dataset, making them better suited for real-world scenarios. Compared to the paper’s weights, they provide improved generalization and robustness across a wider range of images and videos. We plan to release updated versions trained on even broader datasets in the future to further enhance performance for practical applications.
 
 
 ### 1. Inference

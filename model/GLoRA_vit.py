@@ -79,34 +79,53 @@ class Mlp(nn.Module):
         self.lora1_loc = LoRALayer(in_features, hidden_features)
         self.lora2_loc = LoRALayer(hidden_features, out_features)
 
+    def merge_lora(self):
+        """Pre-compute merged weights for each LoRA path."""
+        with torch.no_grad():
+            loc1 = (self.lora1_loc.lora_A @ self.lora1_loc.lora_B * self.lora1_loc.scale).T
+            glo1 = (self.lora1_glo.lora_A @ self.lora1_glo.lora_B * self.lora1_glo.scale).T
+            self.register_buffer('_fc1_w_loc', self.fc1.weight.data + loc1)
+            self.register_buffer('_fc1_w_glo', self.fc1.weight.data + glo1)
+
+            loc2 = (self.lora2_loc.lora_A @ self.lora2_loc.lora_B * self.lora2_loc.scale).T
+            glo2 = (self.lora2_glo.lora_A @ self.lora2_glo.lora_B * self.lora2_glo.scale).T
+            self.register_buffer('_fc2_w_loc', self.fc2.weight.data + loc2)
+            self.register_buffer('_fc2_w_glo', self.fc2.weight.data + glo2)
+
     def forward(self, x: Tensor, use_lora: int = 0) -> Tensor:
         """Forward pass with optional LoRA adaptation.
-        
+
         Args:
             x: Input tensor of shape (B, N, C) or (B, C, H, W) if use_conv=True.
             use_lora: LoRA mode (0: none, 1: global, 3: local).
-        
+
         Returns:
             Output tensor with the same shape as input.
         """
-        if use_lora == 1:
+        if hasattr(self, '_fc1_w_loc'):
+            w1 = self._fc1_w_glo if use_lora == 1 else self._fc1_w_loc
+            x = F.linear(x, w1, self.fc1.bias)
+        elif use_lora == 1:
             x = self.fc1(x) + self.lora1_glo(x)
         elif use_lora == 3:
             x = self.fc1(x) + self.lora1_loc(x)
         else:
             x = self.fc1(x) + self.lora1_loc(x)
-        
+
         x = self.act(x)
         x = self.drop1(x)
         x = self.norm(x)
-        
-        if use_lora == 1:
+
+        if hasattr(self, '_fc2_w_loc'):
+            w2 = self._fc2_w_glo if use_lora == 1 else self._fc2_w_loc
+            x = F.linear(x, w2, self.fc2.bias)
+        elif use_lora == 1:
             x = self.fc2(x) + self.lora2_glo(x)
         elif use_lora == 3:
             x = self.fc2(x) + self.lora2_loc(x)
         else:
             x = self.fc2(x) + self.lora2_loc(x)
-        
+
         x = self.drop2(x)
         return x
 
@@ -176,23 +195,6 @@ def apply_rope(x: Tensor, pos_ids: Tensor, rotary_dim: int) -> Tensor:
 
     x_rotated = x_rot * cos + rotate_half(x_rot) * sin
     return torch.cat([x_rotated, x_pass], dim=-1)
-
-def apply_2d_rope(x: Tensor, h_ids: Tensor, w_ids: Tensor, rotary_dim: int = 16) -> Tensor:
-    """Apply 2D Rotary Position Embedding.
-    
-    Args:
-        x: Input tensor of shape [B, L, H, D].
-        h_ids: Height position IDs of shape [B, L].
-        w_ids: Width position IDs of shape [B, L].
-        rotary_dim: Number of dimensions for rotation.
-    
-    Returns:
-        Tensor with 2D RoPE applied.
-    """
-    x_h, x_w, x_remain = torch.split(x, [rotary_dim, rotary_dim, x.shape[-1] - 2 * rotary_dim], dim=-1)
-    x_h = apply_rope(x_h, h_ids, rotary_dim)
-    x_w = apply_rope(x_w, w_ids, rotary_dim)
-    return torch.cat([x_h, x_w, x_remain], dim=-1)
 
 def apply_4d_rope(x: Tensor, t_ids: Tensor, tpp_ids: Tensor, h_ids: Tensor, w_ids: Tensor, 
                   t_rotary_dim: int = 8, s_rotary_dim: int = 8) -> Tensor:
@@ -382,6 +384,21 @@ class Attention(nn.Module):
             self.qkv_lora_loc = LoRALayer(dim, dim * 3, rank=lora_rank, alpha=lora_alpha)
             self.proj_lora_loc = LoRALayer(dim, dim, rank=lora_rank, alpha=lora_alpha)
 
+    def merge_lora(self):
+        """Pre-compute merged weights for each LoRA path to eliminate runtime LoRA overhead."""
+        if not self.use_lora:
+            return
+        with torch.no_grad():
+            loc_qkv = (self.qkv_lora_loc.lora_A @ self.qkv_lora_loc.lora_B * self.qkv_lora_loc.scale).T
+            glo_qkv = (self.qkv_lora_glo.lora_A @ self.qkv_lora_glo.lora_B * self.qkv_lora_glo.scale).T
+            self.register_buffer('_qkv_w_loc', self.qkv.weight.data + loc_qkv)
+            self.register_buffer('_qkv_w_glo', self.qkv.weight.data + glo_qkv)
+
+            loc_proj = (self.proj_lora_loc.lora_A @ self.proj_lora_loc.lora_B * self.proj_lora_loc.scale).T
+            glo_proj = (self.proj_lora_glo.lora_A @ self.proj_lora_glo.lora_B * self.proj_lora_glo.scale).T
+            self.register_buffer('_proj_w_loc', self.proj.weight.data + loc_proj)
+            self.register_buffer('_proj_w_glo', self.proj.weight.data + glo_proj)
+
     def apply_rope(self, x: Tensor, valid: Optional[Tensor], grid_size: Optional[int], clip_len: Optional[int]) -> Tensor:
         """Apply 4D RoPE to the input tensor.
         
@@ -400,24 +417,30 @@ class Attention(nn.Module):
             t_rotary_dim=8, s_rotary_dim=8
         ).transpose(1, 2)
 
-    def forward(self, x: Tensor, use_lora: int = 0, valid: Optional[Tensor] = None, 
-                grid_size: Optional[int] = None, clip_len: Optional[int] = None) -> Tensor:
+    def forward(self, x: Tensor, use_lora: int = 0, valid: Optional[Tensor] = None,
+                grid_size: Optional[int] = None, clip_len: Optional[int] = None,
+                attn_mask: Optional[Tensor] = None, position_ids_4d: Optional[Tensor] = None) -> Tensor:
         """Forward pass with optional LoRA and RoPE.
-        
+
         Args:
             x: Input tensor of shape (B, N, C).
             use_lora: LoRA mode (0: none, 1: global, 3: local).
             valid: Valid indices for spatial positions.
             grid_size: Size of the spatial grid.
             clip_len: Number of temporal frames.
-        
+            attn_mask: Optional attention mask of shape [B, 1, N, N], float with -inf for masked positions.
+            position_ids_4d: Optional pre-computed position IDs of shape [4, B, N] for batched RoPE.
+
         Returns:
             Output tensor of shape (B, N, C).
         """
         B, N, C = x.shape
 
         # Compute Q, K, V with optional LoRA
-        if use_lora == 1:
+        if hasattr(self, '_qkv_w_loc'):
+            w = self._qkv_w_glo if use_lora == 1 else self._qkv_w_loc
+            qkv = F.linear(x, w, self.qkv.bias)
+        elif use_lora == 1:
             qkv = self.qkv(x) + self.qkv_lora_glo(x)
         elif use_lora == 3:
             qkv = self.qkv(x) + self.qkv_lora_loc(x)
@@ -431,22 +454,41 @@ class Attention(nn.Module):
 
         # Apply RoPE if specified
         if use_lora == 1:
-            q = self.apply_rope(q, valid, grid_size, clip_len)
-            k = self.apply_rope(k, valid, grid_size, clip_len)
+            if position_ids_4d is not None:
+                q = apply_4d_rope(
+                    q.transpose(1, 2), position_ids_4d[0], position_ids_4d[1],
+                    position_ids_4d[2], position_ids_4d[3],
+                    t_rotary_dim=8, s_rotary_dim=8
+                ).transpose(1, 2)
+                k = apply_4d_rope(
+                    k.transpose(1, 2), position_ids_4d[0], position_ids_4d[1],
+                    position_ids_4d[2], position_ids_4d[3],
+                    t_rotary_dim=8, s_rotary_dim=8
+                ).transpose(1, 2)
+            else:
+                q = self.apply_rope(q, valid, grid_size, clip_len)
+                k = self.apply_rope(k, valid, grid_size, clip_len)
 
         # Compute attention
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+            x = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask,
+                dropout_p=self.attn_drop.p if self.training else 0.0)
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
+            if attn_mask is not None:
+                attn = attn + attn_mask
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
 
         # Project output with optional LoRA
         x = x.transpose(1, 2).reshape(B, N, C)
-        if use_lora == 1:
+        if hasattr(self, '_proj_w_loc'):
+            w = self._proj_w_glo if use_lora == 1 else self._proj_w_loc
+            x = F.linear(x, w, self.proj.bias)
+        elif use_lora == 1:
             x = self.proj(x) + self.proj_lora_glo(x)
         elif use_lora == 3:
             x = self.proj(x) + self.proj_lora_loc(x)
@@ -525,24 +567,33 @@ class Block(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-    def forward(self, x: Tensor, use_lora: int = 0, valid: Optional[Tensor] = None, 
-                grid_size: Optional[int] = None, clip_len: Optional[int] = None) -> Tensor:
+    def merge_lora(self):
+        """Merge LoRA weights in both attention and MLP sub-modules."""
+        self.attn.merge_lora()
+        self.mlp.merge_lora()
+
+    def forward(self, x: Tensor, use_lora: int = 0, valid: Optional[Tensor] = None,
+                grid_size: Optional[int] = None, clip_len: Optional[int] = None,
+                attn_mask: Optional[Tensor] = None, position_ids_4d: Optional[Tensor] = None) -> Tensor:
         """Forward pass through the block.
-        
+
         Args:
             x: Input tensor of shape (B, N, C).
             use_lora: LoRA mode (0: none, 1: global, 3: local).
             valid: Valid indices for spatial positions.
             grid_size: Size of the spatial grid.
             clip_len: Number of temporal frames.
-        
+            attn_mask: Optional attention mask for batched global attention.
+            position_ids_4d: Optional pre-computed 4D position IDs for batched RoPE.
+
         Returns:
             Output tensor of shape (B, N, C).
         """
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), use_lora, valid, grid_size, clip_len)))
+        x = x + self.drop_path1(self.ls1(self.attn(
+            self.norm1(x), use_lora, valid, grid_size, clip_len,
+            attn_mask=attn_mask, position_ids_4d=position_ids_4d)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x), use_lora)))
         return x
-
 
 
 def replace_vit_modules(model, dropout=0., drop_path_rate=0.1, custom_block_class=Block, depth=12):

@@ -3,41 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 import numpy as np
-from PIL import Image
 
-from .GLoRA_vit import DecAttention, replace_vit_modules
-
-def to_NCHW(x, h=None, w=None):
-    """
-    Convert tensor from (B, N, C) to (B, C, H, W) format.
-    
-    Args:
-        x (torch.Tensor): Input tensor of shape (B, N, C).
-        h (int, optional): Height of the output tensor. Inferred if None.
-        w (int, optional): Width of the output tensor. Inferred if None.
-    
-    Returns:
-        torch.Tensor: Reshaped tensor in (B, C, H, W) format.
-    """
-    B, N, C = x.shape
-    if h is None or w is None:
-        h = w = int(N ** 0.5)
-    x = x.view(B, h, w, C).permute(0, 3, 1, 2)
-    return x
-
-def to_BNC(x):
-    """
-    Convert tensor from (B, C, H, W) to (B, N, C) format.
-    
-    Args:
-        x (torch.Tensor): Input tensor of shape (B, C, H, W).
-    
-    Returns:
-        torch.Tensor: Reshaped tensor in (B, N, C) format.
-    """
-    B, C, H, W = x.shape
-    x = x.view(B, C, H*W).permute(0, 2, 1)
-    return x
+from .GLoRA_vit import DecAttention, replace_vit_modules, build_4d_position_ids
 
 class GatedMaskDecoder(nn.Module):
     """
@@ -187,9 +154,14 @@ class RelayFormer(nn.Module):
         # Binary cross-entropy loss for training
         self.BCE_loss = nn.BCEWithLogitsLoss()
 
+    def merge_lora(self):
+        """Merge all LoRA weights for faster inference. Call before eval."""
+        for block in self.vit.blocks:
+            block.merge_lora()
+
     def divide_patches(self, x):
         """
-        Divide input image into patches.
+        Divide input image into patches using unfold.
 
         Args:
             x (torch.Tensor): Input tensor of shape (B, C, H, W).
@@ -197,13 +169,67 @@ class RelayFormer(nn.Module):
         Returns:
             torch.Tensor: Patches of shape (B, N, C, patch_h, patch_w).
         """
-        B, C, H, W = x.shape
-        patches = []
-        for y in range(0, H - self.patch_size + 1, self.stride):
-            for x_pos in range(0, W - self.patch_size + 1, self.stride):
-                patch = x[:, :, y:y+self.patch_size, x_pos:x_pos+self.patch_size]
-                patches.append(patch)
-        return torch.stack(patches, dim=1)
+        patches = x.unfold(2, self.patch_size, self.stride).unfold(3, self.patch_size, self.stride)
+        B, C, n_h, n_w, ph, pw = patches.shape
+        return patches.permute(0, 2, 3, 1, 4, 5).reshape(B, n_h * n_w, C, ph, pw)
+
+    def _batched_global_attention(self, relay_tokens_list, sample_infos, block):
+        """
+        Process relay tokens from all samples in a single batched forward pass.
+
+        Args:
+            relay_tokens_list: List of tensors, each [1, num_tokens_i, C].
+            sample_infos: List of dicts with 'valid', 'clip_len', 'num_patches'.
+            block: The ViT block to use for global attention.
+
+        Returns:
+            List of processed tensors, each [num_patches_i, tpp, C].
+        """
+        num_samples = len(relay_tokens_list)
+        tpp = self.tpp
+
+        if num_samples == 1:
+            info = sample_infos[0]
+            processed_flat = block(
+                relay_tokens_list[0], use_lora=1,
+                valid=info['valid'],
+                grid_size=self.grid_size,
+                clip_len=info['clip_len']
+            )
+            return [processed_flat.view(info['num_patches'], tpp, -1)]
+
+        device = relay_tokens_list[0].device
+        dtype = relay_tokens_list[0].dtype
+        C = relay_tokens_list[0].shape[2]
+
+        lengths = [r.shape[1] for r in relay_tokens_list]
+        max_len = max(lengths)
+
+        padded = torch.zeros(num_samples, max_len, C, device=device, dtype=dtype)
+        for i, (r, l) in enumerate(zip(relay_tokens_list, lengths)):
+            padded[i, :l] = r[0]
+
+        attn_mask = torch.zeros(num_samples, 1, max_len, max_len, device=device, dtype=dtype)
+        for i, l in enumerate(lengths):
+            if l < max_len:
+                attn_mask[i, :, :l, l:] = float('-inf')
+                attn_mask[i, :, l:, :] = 0
+
+        position_ids = torch.zeros(4, num_samples, max_len, device=device, dtype=torch.long)
+        for i, info in enumerate(sample_infos):
+            pid = build_4d_position_ids(
+                info['clip_len'], info['valid'], self.grid_size, tpp, device=device)
+            position_ids[:, i, :lengths[i]] = pid[:, 0, :]
+
+        processed = block(
+            padded, use_lora=1,
+            attn_mask=attn_mask, position_ids_4d=position_ids
+        )
+
+        results = []
+        for i, info in enumerate(sample_infos):
+            results.append(processed[i, :lengths[i]].view(info['num_patches'], tpp, C))
+        return results
 
     def forward_features(self, patches_list, valid_patches_list, grid_hw_list, clip_len_list):
         """
@@ -223,7 +249,7 @@ class RelayFormer(nn.Module):
         for patches in patches_list:
             all_patches.append(patches)
             patch_counts.append(patches.shape[0])
-            
+
         x = torch.cat(all_patches, dim=0)
 
         # Vision Transformer forward pass
@@ -238,53 +264,56 @@ class RelayFormer(nn.Module):
 
         for i, blk in enumerate(self.vit.blocks):
             x = blk(x, use_lora=0, grid_size=self.grid_size)
-            x_processed_list = []
-            start_idx, end_idx = 0, 0
-            loc_x = x[:, self.tpp:]
 
+            # Phase 1: Collect relay tokens and reconstruct local tokens per sample
+            relay_tokens_list = []
+            loc_tokens_list = []
+            sample_infos = []
+
+            start_idx = 0
             batch_idx = 0
             video_batch = 0
-            while end_idx < x.shape[0]:
+            while start_idx < x.shape[0]:
                 clip_len = clip_len_list[batch_idx].item()
                 patch_count = patch_counts[video_batch]
                 num_patches = patch_count * clip_len
-                
                 end_idx = start_idx + num_patches
+
                 x_batch = x[start_idx:end_idx]
-                loc_x_i = loc_x[start_idx:end_idx]
+                loc_x_i = x_batch[:, tpp:]
 
-                loc_x_i_list = []
-                for j in range(clip_len):
-                    loc_x_i_list.append(
-                        self.reconstruct_from_overlap_patches(
-                            loc_x_i[j*patch_count:(j+1)*patch_count],
-                            valid_patches_list[video_batch],
-                            grid_hw_list[video_batch]
-                        )
-                    )
-                loc_x_i = torch.cat(loc_x_i_list)
+                loc_reconstructed = self._reconstruct_multi_frame(
+                    loc_x_i, valid_patches_list[video_batch],
+                    grid_hw_list[video_batch], clip_len, patch_count)
+                loc_tokens_list.append(loc_reconstructed)
 
-                x_reshaped = x_batch.unsqueeze(0)
-                selected, glo_x = x_reshaped[:, :, :self.tpp], x_reshaped[:, :, self.tpp:]
+                relay = x_batch[:, :tpp].contiguous().view(1, num_patches * tpp, C)
+                relay_tokens_list.append(relay)
 
-                if i+1 < len(self.vit.blocks):
-                    selected_flat = selected.contiguous().view(1, num_patches*tpp, C)
-                    processed_flat = self.vit.blocks[i+1](
-                        selected_flat, use_lora=1,
-                        valid=valid_patches_list[video_batch],
-                        grid_size=self.grid_size,
-                        clip_len=clip_len
-                    )
-                    processed = processed_flat.view(num_patches, tpp, C)
-                else:
-                    processed = selected.squeeze(0)
-
-                x_batch_reshaped = torch.cat([processed, loc_x_i], dim=1)
-                x_processed_list.append(x_batch_reshaped)
+                sample_infos.append({
+                    'num_patches': num_patches,
+                    'valid': valid_patches_list[video_batch],
+                    'clip_len': clip_len,
+                })
 
                 start_idx = end_idx
                 batch_idx += 1
                 video_batch += clip_len
+
+            # Phase 2: Batched global attention on relay tokens
+            if i + 1 < len(self.vit.blocks):
+                processed_relays = self._batched_global_attention(
+                    relay_tokens_list, sample_infos, self.vit.blocks[i+1])
+            else:
+                processed_relays = [r.squeeze(0).view(info['num_patches'], tpp, C)
+                                    for r, info in zip(relay_tokens_list, sample_infos)]
+
+            # Phase 3: Reassemble
+            x_processed_list = []
+            for idx in range(len(sample_infos)):
+                x_batch_reshaped = torch.cat(
+                    [processed_relays[idx], loc_tokens_list[idx]], dim=1)
+                x_processed_list.append(x_batch_reshaped)
 
             x = torch.cat(x_processed_list, dim=0)
 
@@ -347,9 +376,16 @@ class RelayFormer(nn.Module):
             patches_list.append(selected_patches)
         return patches_list
 
+    def _get_recon_dims(self, grid_hw):
+        """Compute reconstructed feature map dimensions for a given grid layout."""
+        grid_h, grid_w = grid_hw
+        H = self.feature_patch_size if grid_h == 1 else grid_h * self.feature_stride + self.feature_overlap * 2
+        W = self.feature_patch_size if grid_w == 1 else grid_w * self.feature_stride + self.feature_overlap * 2
+        return H, W
+
     def reconstruct_from_overlap_patches(self, patches, valid_indices, grid_hw, for_decode=False):
         """
-        Reconstruct feature map from overlapping patches.
+        Reconstruct feature map from overlapping patches using F.fold.
 
         Args:
             patches (torch.Tensor): Patch features of shape (num_valid, N, C).
@@ -360,44 +396,60 @@ class RelayFormer(nn.Module):
         Returns:
             torch.Tensor: Reconstructed feature map.
         """
-        np, N, C = patches.shape
-        grid_h, grid_w = grid_hw
+        num_patches, N, C = patches.shape
+        fp = self.feature_patch_size
+        H, W = self._get_recon_dims(grid_hw)
 
-        # Compute reconstructed dimensions
-        if grid_h == 1:
-            H = self.feature_patch_size
-        else:
-            H = grid_h * self.feature_stride + self.feature_overlap * 2
-        if grid_w == 1:
-            W = self.feature_patch_size
-        else:
-            W = grid_w * self.feature_stride + self.feature_overlap * 2
+        fold_input = (patches.view(num_patches, fp, fp, C)
+                      .permute(3, 1, 2, 0)
+                      .reshape(1, C * fp * fp, num_patches))
 
-        # Initialize reconstruction and count tensors
-        recon = torch.zeros((H, W, C), dtype=patches.dtype, device=patches.device)
-        count = torch.zeros((H, W, 1), dtype=patches.dtype, device=patches.device)
+        recon = F.fold(fold_input, output_size=(H, W), kernel_size=fp, stride=self.feature_stride)
 
-        for idx_in_list, patch_idx in enumerate(valid_indices):
-            row = patch_idx // self.grid_size
-            col = patch_idx % self.grid_size
-            y = row * self.feature_stride
-            x = col * self.feature_stride
-            patch = patches[idx_in_list].view(self.feature_patch_size, self.feature_patch_size, C)
-            recon[y:y+self.feature_patch_size, x:x+self.feature_patch_size, :] += patch
-            count[y:y+self.feature_patch_size, x:x+self.feature_patch_size, :] += 1
-
-        count = torch.clamp(count, min=1.0)
-        recon = recon / count
+        ones = torch.ones(1, fp * fp, num_patches, device=patches.device, dtype=patches.dtype)
+        count = F.fold(ones, output_size=(H, W), kernel_size=fp, stride=self.feature_stride)
+        recon = recon / torch.clamp(count, min=1.0)
 
         if for_decode:
-            return recon.unsqueeze(0).permute(0, 3, 1, 2)
+            return recon
 
-        patches_reconstructed = self.divide_feature_patches(recon.unsqueeze(0).permute(0, 3, 1, 2))
-        return patches_reconstructed.view(np, C, N).permute(0, 2, 1)
+        patches_reconstructed = self.divide_feature_patches(recon)
+        return patches_reconstructed.view(num_patches, C, N).permute(0, 2, 1)
+
+    def _reconstruct_multi_frame(self, patches, valid_indices, grid_hw, clip_len, patch_count):
+        """
+        Batched reconstruction for multiple frames sharing the same grid layout.
+
+        Args:
+            patches (torch.Tensor): (clip_len * patch_count, N, C).
+            valid_indices (list): Valid patch indices.
+            grid_hw (tuple): Grid dimensions (h, w).
+            clip_len (int): Number of frames.
+            patch_count (int): Patches per frame.
+
+        Returns:
+            torch.Tensor: Reconstructed patches (clip_len * patch_count, N, C).
+        """
+        N, C = patches.shape[1], patches.shape[2]
+        fp = self.feature_patch_size
+        H, W = self._get_recon_dims(grid_hw)
+
+        fold_input = (patches.view(clip_len, patch_count, fp, fp, C)
+                      .permute(0, 4, 2, 3, 1)
+                      .reshape(clip_len, C * fp * fp, patch_count))
+
+        recon = F.fold(fold_input, output_size=(H, W), kernel_size=fp, stride=self.feature_stride)
+
+        ones = torch.ones(1, fp * fp, patch_count, device=patches.device, dtype=patches.dtype)
+        count = F.fold(ones, output_size=(H, W), kernel_size=fp, stride=self.feature_stride)
+        recon = recon / torch.clamp(count, min=1.0)
+
+        patches_out = self.divide_feature_patches(recon)
+        return patches_out.reshape(clip_len * patch_count, C, N).permute(0, 2, 1)
 
     def divide_feature_patches(self, x):
         """
-        Divide feature map into feature patches.
+        Divide feature map into feature patches using unfold.
 
         Args:
             x (torch.Tensor): Input feature tensor of shape (B, C, H, W).
@@ -405,13 +457,10 @@ class RelayFormer(nn.Module):
         Returns:
             torch.Tensor: Patches of shape (B, N, C, patch_h, patch_w).
         """
-        B, C, H, W = x.shape
-        patches = []
-        for y in range(0, H - self.feature_patch_size + 1, self.feature_stride):
-            for x_pos in range(0, W - self.feature_patch_size + 1, self.feature_stride):
-                patch = x[:, :, y:y+self.feature_patch_size, x_pos:x_pos+self.feature_patch_size]
-                patches.append(patch)
-        return torch.stack(patches, dim=1)
+        fp = self.feature_patch_size
+        patches = x.unfold(2, fp, self.feature_stride).unfold(3, fp, self.feature_stride)
+        B, C, n_h, n_w, ph, pw = patches.shape
+        return patches.permute(0, 2, 3, 1, 4, 5).reshape(B, n_h * n_w, C, ph, pw)
 
     def assemble_and_decode(self, x, images, valid_patches_list, grid_hw_list, grid_size=2):
         """

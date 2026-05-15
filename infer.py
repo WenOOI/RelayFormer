@@ -308,11 +308,7 @@ class InferenceProcessor:
         
         # Process each sample
         for batch in tqdm(dataloader, desc="Processing"):
-            # try:
             self.process_single_sample(batch)
-            # except Exception as e:
-            #     print(f"Error processing {batch.get('name', 'unknown')}: {str(e)}")
-            #     continue
         
         print("Processing completed!")
 
@@ -320,7 +316,8 @@ class InferenceProcessor:
 def create_model(model_path):
     model = RelayFormer()
     ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
-    model.load_state_dict(ckpt['model'])     
+    model.load_state_dict(ckpt['model'])
+    model.merge_lora()
     return model
 
 

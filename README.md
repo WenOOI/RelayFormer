@@ -1,9 +1,12 @@
 # RelayFormer
 
 [![Paper](https://img.shields.io/badge/arXiv-2508.09459-b31b1b.svg)](https://arxiv.org/abs/2508.09459)
+[![ICLR 2026](https://img.shields.io/badge/ICLR-2026-blueviolet.svg)](https://arxiv.org/abs/2508.09459)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)]()
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-orange.svg)]()
+
+> 🎉 **Accepted to ICLR 2026!**
 
 **RelayFormer: A Unified Local–Global Attention Framework for Scalable Image & Video Manipulation Localization**
 Official PyTorch implementation of our paper:
@@ -52,7 +55,7 @@ original footage. The red mask regions indicate the areas the model predicts as 
 - ✅ Inference code with sample scripts & demo
 - ✅ Training code with full configurations (image / video / mixed)
 - ✅ Documentation for datasets & evaluation
-- [ ] Parallel inference for mixed video/image inputs at dynamic resolution
+- ✅ Parallel inference for mixed video/image inputs at dynamic resolution
 
 ---
 
@@ -117,6 +120,9 @@ The training mode is decided entirely by the dataset config — a flat list of e
   ["VideoDataset", "/path/to/DAVIS", ["OPN","DVI"]] // video dir + manipulation methods
 ]
 ```
+
+> 📂 For image-category datasets (formats, download links, and preparation), see the
+> [IMDLBenCo dataset hub](https://scu-zjz.github.io/IMDLBenCo-doc/imdl_data_model_hub/data/IMDLdatasets.html).
 
 | Entries present                    | Mode        | Script                    |
 |------------------------------------|-------------|---------------------------|

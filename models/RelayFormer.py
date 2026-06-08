@@ -4,24 +4,17 @@ import torch.nn.functional as F
 import timm
 import numpy as np
 
+from IMDLBenCo.registry import MODELS
+
 from .GLoRA_vit import DecAttention, replace_vit_modules, build_4d_position_ids
+
 
 class GatedMaskDecoder(nn.Module):
     """
     A decoder module that generates masks using cross-attention, self-attention, and feed-forward networks.
     """
-    def __init__(self, in_channels: int, num_queries: int, hidden_dim: int = 256, 
+    def __init__(self, in_channels: int, num_queries: int, hidden_dim: int = 256,
                  num_heads: int = 8, num_layers: int = 1):
-        """
-        Initialize the GatedMaskDecoder.
-
-        Args:
-            in_channels (int): Number of input channels.
-            num_queries (int): Number of mask queries.
-            hidden_dim (int): Dimension of the hidden layers (default: 256).
-            num_heads (int): Number of attention heads (default: 8).
-            num_layers (int): Number of decoder layers (default: 1).
-        """
         super().__init__()
         self.in_channels = in_channels
         self.hidden_dim = hidden_dim
@@ -39,8 +32,8 @@ class GatedMaskDecoder(nn.Module):
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
             layer = nn.ModuleDict({
-                'cross_attn': nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, 
-                                                  dropout=0.1, batch_first=True),
+                'cross_attn': nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads,
+                                                    dropout=0.1, batch_first=True),
                 'norm_cross': nn.LayerNorm(hidden_dim),
                 'self_attn': DecAttention(dim=hidden_dim, num_heads=num_heads, proj_drop=0.1),
                 'norm_self': nn.LayerNorm(hidden_dim),
@@ -59,16 +52,6 @@ class GatedMaskDecoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, num_patches=4) -> torch.Tensor:
-        """
-        Forward pass of the GatedMaskDecoder.
-
-        Args:
-            x (torch.Tensor): Input feature tensor of shape (B, C, H, W).
-            num_patches (int): Number of patches (default: 4).
-
-        Returns:
-            torch.Tensor: Final mask of shape (B, 1, H, W).
-        """
         B, C, H, W = x.shape
         # Project input features
         x_proj = self.input_proj(x)  # (B, hidden_dim, H, W)
@@ -100,49 +83,87 @@ class GatedMaskDecoder(nn.Module):
 
         return final_mask
 
+
+@MODELS.register_module()
 class RelayFormer(nn.Module):
     """
-    RelayFormer model for processing images by dividing them into patches and generating masks.
-    """
-    def __init__(self, input_size=1024, vit_model_name='vit_base_patch16_224', 
-                 tokens_per_patch=2, patch_size=528, overlap=16, 
-                 feature_patch_size=33, feature_overlap=1):
-        """
-        Initialize the RelayFormer model.
+    RelayFormer: unified local-global attention framework for image & video manipulation localization.
 
-        Args:
-            input_size (int): Input image size (default: 1024).
-            vit_model_name (str): Name of the Vision Transformer model (default: 'vit_base_patch16_224').
-            tokens_per_patch (int): Number of tokens per patch (default: 2).
-            patch_size (int): Size of image patches (default: 528).
-            overlap (int): Overlap pixels for image patches (default: 16).
-            feature_patch_size (int): Size of feature patches (default: 33).
-            feature_overlap (int): Overlap pixels for feature patches (default: 1).
+    This is the optimized model (batched global attention + F.fold reconstruction + LoRA merging)
+    wired into the IMDLBenCo training/testing pipeline. The same `forward` serves three purposes:
+      - training: when `mask` is provided, returns an output dict with `backward_loss`.
+      - testing: same path (IMDLBenCo passes `mask`); the returned `pred_mask` is used by evaluators.
+      - pure inference: when `mask` is None, returns the predicted mask tensor directly.
+
+    Image-only / video-only / mixed training is handled entirely by the dataset; the model just
+    sees a flattened batch of frames described by `clip_len` and `origin_shape`.
+    """
+    def __init__(self,
+                 input_size: int = 1024,
+                 vit_model_name: str = 'vit_base_patch16_224',
+                 vit_pretrain_path: str = '',
+                 tokens_per_patch: int = 2,
+                 edge_lambda: int = 20,
+                 grid_size: int = 0,
+                 patch_size: int = 528,
+                 overlap: int = 16,
+                 feature_patch_size: int = 33,
+                 feature_overlap: int = 1):
+        """
+        Args (auto-exposed as CLI flags by the IMDLBenCo argparser via type annotations):
+            input_size: model working resolution (must equal dataset image_size).
+            vit_model_name: timm ViT backbone name.
+            vit_pretrain_path: path to a ViT checkpoint (.bin/.pth). Empty -> timm auto-download.
+            tokens_per_patch: number of relay tokens per patch.
+            edge_lambda: weight for the edge-aware BCE loss term.
+            grid_size: max NxN tiling per image. 0 (default) -> derive as input_size // 512.
+                Set explicitly (e.g. 2) to reproduce a fixed tiling at a non-1024 resolution.
+            patch_size / overlap: image-space patch tiling.
+            feature_patch_size / feature_overlap: feature-space patch tiling.
+
+        Resolution presets (input_size : patch_size / feature_patch_size : grid_size):
+            1024 : 528 / 33 : 2   (default; grid auto-derived)
+            512  : 272 / 17 : 2   (pass --grid_size 2 explicitly)
         """
         super().__init__()
-        
+
         self.input_size = input_size
-        
+        self.edge_lambda = edge_lambda
+
         # Patch parameters
         self.patch_size = patch_size
         self.overlap = overlap
         self.feature_patch_size = feature_patch_size
         self.feature_overlap = feature_overlap
-        
+
         # Compute strides
         self.stride = self.patch_size - self.overlap * 2
         self.feature_stride = self.feature_patch_size - self.feature_overlap * 2
 
-        # create Vision Transformer
-        vit = timm.create_model(vit_model_name, num_classes=0, reg_tokens=1, 
-                                    drop_path_rate=0.1, dynamic_img_size=True, 
-                                    no_embed_class=False)
+        # Create Vision Transformer. When no checkpoint path is given we let timm pull its
+        # pretrained ImageNet weights so the (replaced) blocks still start from a good init.
+        use_timm_pretrained = (vit_pretrain_path is None or vit_pretrain_path == '')
+        vit = timm.create_model(vit_model_name, pretrained=use_timm_pretrained, num_classes=0,
+                                reg_tokens=1, drop_path_rate=0.1, dynamic_img_size=True,
+                                no_embed_class=False)
+        pretrained_state = vit.state_dict() if use_timm_pretrained else None
+
+        # Replace stock blocks with LoRA + 4D-RoPE blocks (parameter names for the shared
+        # qkv/proj/fc layers are preserved, so pretrained weights can be loaded afterwards).
         self.vit = replace_vit_modules(vit)
         self.feature_dim = self.vit.num_features
 
+        if use_timm_pretrained:
+            # Re-load timm pretrained weights into the replaced blocks (LoRA params stay random).
+            missing, unexpected = self.vit.load_state_dict(pretrained_state, strict=False)
+            print(f"[RelayFormer] Loaded timm pretrained ViT. missing={len(missing)}, unexpected={len(unexpected)}")
+        else:
+            self._load_vit_checkpoint(vit_pretrain_path)
+
         self.tpp = tokens_per_patch
-        self.grid_size = input_size // 512
-        
+        # 0 -> auto-derive (1024 yields 2). Override to pin a fixed tiling at other resolutions.
+        self.grid_size = grid_size if grid_size > 0 else input_size // 512
+
         # Initialize mask decoder
         self.mask_decoder = GatedMaskDecoder(
             in_channels=self.feature_dim,
@@ -150,9 +171,30 @@ class RelayFormer(nn.Module):
             hidden_dim=256,
             num_layers=3,
         )
-        
+
         # Binary cross-entropy loss for training
         self.BCE_loss = nn.BCEWithLogitsLoss()
+
+    def _load_vit_checkpoint(self, path: str):
+        """Load a ViT checkpoint, adapting pos_embed for the extra register token if needed."""
+        state_dict = torch.load(path, map_location='cpu', weights_only=False)
+        state_dict = state_dict.get('model', state_dict)
+        # Strip a possible "vit." prefix.
+        state_dict = {k[4:] if k.startswith('vit.') else k: v for k, v in state_dict.items()}
+
+        if 'pos_embed' in state_dict:
+            ckpt_len = state_dict['pos_embed'].shape[1]
+            model_len = self.vit.pos_embed.shape[1]
+            # Checkpoint lacks the register-token slot -> insert one after the cls token.
+            if ckpt_len == model_len - 1:
+                orig_pos = state_dict['pos_embed']
+                embed_dim = orig_pos.shape[2]
+                new_pe = torch.randn(1, 1, embed_dim) * 0.02
+                state_dict['pos_embed'] = torch.cat([orig_pos[:, :1, :], new_pe, orig_pos[:, 1:, :]], dim=1)
+
+        missing, unexpected = self.vit.load_state_dict(state_dict, strict=False)
+        print(f"[RelayFormer] Loaded ViT checkpoint from {path}. "
+              f"missing={len(missing)}, unexpected={len(unexpected)}")
 
     def merge_lora(self):
         """Merge all LoRA weights for faster inference. Call before eval."""
@@ -160,15 +202,7 @@ class RelayFormer(nn.Module):
             block.merge_lora()
 
     def divide_patches(self, x):
-        """
-        Divide input image into patches using unfold.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C, H, W).
-
-        Returns:
-            torch.Tensor: Patches of shape (B, N, C, patch_h, patch_w).
-        """
+        """Divide input image into patches using unfold. Returns (B, N, C, ph, pw)."""
         patches = x.unfold(2, self.patch_size, self.stride).unfold(3, self.patch_size, self.stride)
         B, C, n_h, n_w, ph, pw = patches.shape
         return patches.permute(0, 2, 3, 1, 4, 5).reshape(B, n_h * n_w, C, ph, pw)
@@ -177,13 +211,7 @@ class RelayFormer(nn.Module):
         """
         Process relay tokens from all samples in a single batched forward pass.
 
-        Args:
-            relay_tokens_list: List of tensors, each [1, num_tokens_i, C].
-            sample_infos: List of dicts with 'valid', 'clip_len', 'num_patches'.
-            block: The ViT block to use for global attention.
-
-        Returns:
-            List of processed tensors, each [num_patches_i, tpp, C].
+        Returns a list of processed tensors, each [num_patches_i, tpp, C].
         """
         num_samples = len(relay_tokens_list)
         tpp = self.tpp
@@ -232,18 +260,7 @@ class RelayFormer(nn.Module):
         return results
 
     def forward_features(self, patches_list, valid_patches_list, grid_hw_list, clip_len_list):
-        """
-        Process patches through the Vision Transformer and reconstruct features.
-
-        Args:
-            patches_list (list): List of patch tensors.
-            valid_patches_list (list): List of valid patch indices.
-            grid_hw_list (list): List of grid dimensions (h, w).
-            clip_len_list (list): List of clip lengths.
-
-        Returns:
-            tuple: Processed features and feature list.
-        """
+        """Process patches through the ViT and reconstruct features."""
         all_patches = []
         patch_counts = []
         for patches in patches_list:
@@ -323,18 +340,7 @@ class RelayFormer(nn.Module):
         return x, features
 
     def get_valid_patches_info(self, original_shapes, input_size=1036, grid_size=2, clip_len=None):
-        """
-        Compute valid patch indices and grid information.
-
-        Args:
-            original_shapes (torch.Tensor): Tensor of shape (B, 2) with (H, W) for each image.
-            input_size (int): Target input size (default: 1036).
-            grid_size (int): Grid size for patch division (default: 2).
-            clip_len (list): List of clip lengths.
-
-        Returns:
-            tuple: Valid patches list, maximum valid patches, and grid dimensions list.
-        """
+        """Compute valid patch indices and grid information."""
         shapes = np.array(original_shapes.cpu(), dtype=float)
         scales = shapes / input_size
         needed = np.ceil(scales * grid_size).astype(int)
@@ -356,16 +362,7 @@ class RelayFormer(nn.Module):
 
     @staticmethod
     def select_valid_patches(valid, patches):
-        """
-        Select valid patches based on indices.
-
-        Args:
-            valid (list): List of valid patch indices.
-            patches (torch.Tensor): Patch tensor.
-
-        Returns:
-            list: List of selected patch tensors.
-        """
+        """Select valid patches based on indices."""
         patches_list = []
         for i in range(len(valid)):
             valid_indices = valid[i]
@@ -384,18 +381,7 @@ class RelayFormer(nn.Module):
         return H, W
 
     def reconstruct_from_overlap_patches(self, patches, valid_indices, grid_hw, for_decode=False):
-        """
-        Reconstruct feature map from overlapping patches using F.fold.
-
-        Args:
-            patches (torch.Tensor): Patch features of shape (num_valid, N, C).
-            valid_indices (list): List of valid patch indices.
-            grid_hw (tuple): Grid dimensions (h, w).
-            for_decode (bool): Whether reconstruction is for decoding (default: False).
-
-        Returns:
-            torch.Tensor: Reconstructed feature map.
-        """
+        """Reconstruct feature map from overlapping patches using F.fold."""
         num_patches, N, C = patches.shape
         fp = self.feature_patch_size
         H, W = self._get_recon_dims(grid_hw)
@@ -417,19 +403,7 @@ class RelayFormer(nn.Module):
         return patches_reconstructed.view(num_patches, C, N).permute(0, 2, 1)
 
     def _reconstruct_multi_frame(self, patches, valid_indices, grid_hw, clip_len, patch_count):
-        """
-        Batched reconstruction for multiple frames sharing the same grid layout.
-
-        Args:
-            patches (torch.Tensor): (clip_len * patch_count, N, C).
-            valid_indices (list): Valid patch indices.
-            grid_hw (tuple): Grid dimensions (h, w).
-            clip_len (int): Number of frames.
-            patch_count (int): Patches per frame.
-
-        Returns:
-            torch.Tensor: Reconstructed patches (clip_len * patch_count, N, C).
-        """
+        """Batched reconstruction for multiple frames sharing the same grid layout."""
         N, C = patches.shape[1], patches.shape[2]
         fp = self.feature_patch_size
         H, W = self._get_recon_dims(grid_hw)
@@ -448,76 +422,91 @@ class RelayFormer(nn.Module):
         return patches_out.reshape(clip_len * patch_count, C, N).permute(0, 2, 1)
 
     def divide_feature_patches(self, x):
-        """
-        Divide feature map into feature patches using unfold.
-
-        Args:
-            x (torch.Tensor): Input feature tensor of shape (B, C, H, W).
-
-        Returns:
-            torch.Tensor: Patches of shape (B, N, C, patch_h, patch_w).
-        """
+        """Divide feature map into feature patches using unfold."""
         fp = self.feature_patch_size
         patches = x.unfold(2, fp, self.feature_stride).unfold(3, fp, self.feature_stride)
         B, C, n_h, n_w, ph, pw = patches.shape
         return patches.permute(0, 2, 3, 1, 4, 5).reshape(B, n_h * n_w, C, ph, pw)
 
     def assemble_and_decode(self, x, images, valid_patches_list, grid_hw_list, grid_size=2):
-        """
-        Assemble patches and decode to generate masks.
-
-        Args:
-            x (torch.Tensor): Feature tensor.
-            images (torch.Tensor): Input images.
-            valid_patches_list (list): List of valid patch indices.
-            grid_hw_list (list): List of grid dimensions.
-            grid_size (int): Grid size (default: 2).
-
-        Returns:
-            torch.Tensor: Predicted masks of shape (B, 1, input_size, input_size).
-        """
+        """Assemble patches and decode to generate masks. Returns logits (B, 1, input_size, input_size)."""
         device = x.device
         B = len(valid_patches_list)
         full_masks = torch.zeros(B, 1, self.input_size, self.input_size, device=device) - 10.
 
-        x_list = []
         stx = 0
         for i in range(B):
             edy = stx + len(valid_patches_list[i])
-            ix = self.reconstruct_from_overlap_patches(x[stx:edy], valid_patches_list[i], 
-                                                     grid_hw_list[i], for_decode=True)
+            ix = self.reconstruct_from_overlap_patches(x[stx:edy], valid_patches_list[i],
+                                                       grid_hw_list[i], for_decode=True)
             h, w = grid_hw_list[i]
             pred_mask = self.mask_decoder(ix)
             h = h * self.input_size // self.grid_size
             w = w * self.input_size // self.grid_size
             pred_mask = F.interpolate(pred_mask, size=(int(h), int(w)), mode='bilinear', align_corners=False)
             full_masks[i:i+1, :, :h, :w] = pred_mask
-            x_list.append(ix)
             stx = edy
 
         return full_masks
 
-    def forward(self, image, clip, origin_shape, clip_len, *args, **kwargs):
+    def forward(self, image, clip, origin_shape, clip_len,
+                mask=None, edge_mask=None, label=None, *args, **kwargs):
         """
-        Forward pass of the RelayFormer model.
-
         Args:
-            image (torch.Tensor): Input image tensor.
-            clip (torch.Tensor): Input clip tensor.
-            origin_shape (torch.Tensor): Original image shapes.
-            clip_len (list): List of clip lengths.
+            image:        (B, C, H, W) middle/representative frame per sample (assembled batch).
+            clip:         (B, C, H, W) frames flattened across the batch.
+            origin_shape: (B, 2) original (H, W) per sample.
+            clip_len:     (num_samples,) frames-per-sample; 1 for images, T for video clips.
+            mask:         (B, 1, H, W) ground-truth mask. If None -> pure inference mode.
+            edge_mask:    (B, 1, H, W) optional edge weight map for the edge-aware loss.
 
         Returns:
-            dict: Dictionary containing predicted masks.
+            - dict (IMDLBenCo output interface) when `mask` is provided.
+            - predicted mask tensor (B, 1, H, W) when `mask` is None.
         """
         grid_size = self.grid_size
         patches = self.divide_patches(clip)
         valid_patches_list, max_valid_patches, grid_hw_list = self.get_valid_patches_info(
             origin_shape, self.input_size, grid_size, clip_len=clip_len)
         patches = self.select_valid_patches(valid_patches_list, patches)
-        features, feature_list = self.forward_features(patches, valid_patches_list, 
-                                                     grid_hw_list, clip_len_list=clip_len)
-        pred_mask = self.assemble_and_decode(features[:, self.tpp:], image, 
-                                            valid_patches_list, grid_hw_list, grid_size)
-        mask_pred = torch.sigmoid(pred_mask)
-        return mask_pred
+        features, feature_list = self.forward_features(
+            patches, valid_patches_list, grid_hw_list, clip_len_list=clip_len)
+        pred_logits = self.assemble_and_decode(
+            features[:, self.tpp:], image, valid_patches_list, grid_hw_list, grid_size)
+
+        mask_pred = torch.sigmoid(pred_logits)
+
+        # Pure inference (e.g. infer.py): no ground truth available.
+        if mask is None:
+            return mask_pred
+
+        # Training / testing: compute losses and return the IMDLBenCo output dict.
+        loss_bce = self.BCE_loss(pred_logits, mask)
+        if edge_mask is not None:
+            edge_loss = F.binary_cross_entropy_with_logits(
+                input=pred_logits, target=mask, weight=edge_mask) * self.edge_lambda
+        else:
+            edge_loss = torch.zeros((), device=pred_logits.device)
+        combined_loss = loss_bce + edge_loss
+
+        output_dict = {
+            "backward_loss": combined_loss,
+            "pred_mask": mask_pred,
+            "pred_label": None,
+            "visual_loss": {
+                "bce_loss": loss_bce,
+                "edge_loss": edge_loss,
+                "combined_loss": combined_loss,
+            },
+            "visual_image": {
+                "pred_mask": mask_pred,
+            },
+        }
+        if edge_mask is not None:
+            output_dict["visual_image"]["edge_mask"] = edge_mask
+
+        return output_dict
+
+
+if __name__ == "__main__":
+    print(MODELS)

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Training / testing / inference outputs
+output_dir/
+output_image/
+output_video/
+output_mixed/
+output_test/
+output_infer/
+eval_*/
+*.log
+
+# Checkpoints & weights (do not commit large binaries)
+*.pth
+*.pt
+*.bin
+*.ckpt
+
+# TensorBoard
+events.out.tfevents.*
+runs/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,3 @@
+[
+    ["VideoDataset", "/path/to/DAVIS2016/inpainting", ["OPN", "DVI"]]
+]

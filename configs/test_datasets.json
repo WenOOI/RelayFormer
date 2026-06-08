@@ -1,0 +1,5 @@
+{
+    "CASIA1.0": ["ManiDataset", "/path/to/CASIA1.0"],
+    "coverage": ["JsonDataset", "/path/to/coverage/paired_paths.json"],
+    "MOSE": ["VideoDataset", "/path/to/MOSE512", ["E2FGVI", "FuseFormer", "STTN"]]
+}

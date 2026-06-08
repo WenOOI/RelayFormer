@@ -1,0 +1,5 @@
+[
+    ["ManiDataset", "/path/to/CASIA2.0"],
+    ["JsonDataset", "/path/to/tampCOCO/sp_COCO_list.json"],
+    ["VideoDataset", "/path/to/DAVIS2016/inpainting", ["OPN", "DVI"]]
+]

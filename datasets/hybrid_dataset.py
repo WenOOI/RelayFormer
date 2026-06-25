@@ -377,13 +377,23 @@ class MixedImageVideoDataset(Dataset):
 
         final_shape = self.output_size if self.is_resizing else tp_shape
 
+        # `origin_shape` drives `get_valid_patches_info`, which decides how much of the
+        # `input_size x input_size` canvas the model populates.  It must match what the
+        # model actually sees:
+        #   - is_resizing : the image was resized to `output_size`, so the full canvas is
+        #                   real content; use output_size.  (Reporting the pre-resize size
+        #                   would cause `needed` to underflow, clipping the output mask
+        #                   to a top-left rectangle.)
+        #   - is_padding  : tp_shape is the real-content region; the rest of the canvas
+        #                   is zero-padding the model should skip.
+        # `final_shape` already encodes this, so reuse it.
         # Plain per-frame tensors; the collate_fn will stack or cat depending on layout.
         data_dict = {
             'image': tp_img.to(torch.float),           # C H W
             'mask':  gt_img,                            # 1 H W
             'label': torch.tensor(label),               # scalar
             'clip_len': torch.tensor(1),                # scalar; image == 1-frame clip
-            'origin_shape': torch.tensor(tp_shape),     # (2,)
+            'origin_shape': torch.tensor(final_shape),
             'shape': torch.tensor(final_shape),
             'name': os.path.basename(tp_path),
             '_T': 1,                                    # marker used by collate_fn

@@ -15,7 +15,7 @@ torchrun \
     --test_data_json ./configs/test_datasets.json \
     --checkpoint_path /path/to/checkpoint-best.pth \
     --image_size 1024 \
-    --if_resizing \
+    --if_padding \
     --clip_len 4 \
     --edge_mask_width 7 \
     --merge_lora \

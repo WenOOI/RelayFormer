@@ -87,6 +87,8 @@ def get_albu_transforms(type_: str, output_size: Tuple[int, int]):
     elif type_ == "resize":
         return A.Compose([
             A.Resize(output_size[0], output_size[1]),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            A.Crop(0, 0, output_size[0], output_size[1]),
             ToTensorV2(transpose_mask=True)
         ])
     else:

@@ -17,7 +17,7 @@ torchrun \
     --test_data_path ./configs/test_datasets.json \
     --epochs 200 \
     --lr 1e-4 \
-    --image_size 1024 \
+    --image_size 512 \
     --if_resizing \
     --clip_len 4 \
     --min_lr 5e-7 \
@@ -27,6 +27,7 @@ torchrun \
     --output_dir ${base_dir}/ \
     --log_dir ${base_dir}/ \
     --accum_iter 4 \
+    --num_workers 2 \
     --seed 42 \
     --test_period 4 \
 2> ${base_dir}/error.log 1> ${base_dir}/logs.log

@@ -27,6 +27,7 @@ torchrun \
     --output_dir ${base_dir}/ \
     --log_dir ${base_dir}/ \
     --accum_iter 4 \
+    --num_workers 2 \
     --seed 42 \
     --test_period 4 \
 2> ${base_dir}/error.log 1> ${base_dir}/logs.log

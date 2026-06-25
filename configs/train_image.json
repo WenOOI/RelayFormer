@@ -1,4 +1,3 @@
 [
-    ["ManiDataset", "/path/to/CASIA2.0"],
-    ["JsonDataset", "/path/to/tampCOCO/sp_COCO_list.json"]
+    ["ManiDataset", "/path/to/CASIA2.0"]
 ]

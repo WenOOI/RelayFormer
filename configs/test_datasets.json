@@ -1,5 +1,7 @@
 {
     "CASIA1.0": ["ManiDataset", "/path/to/CASIA1.0"],
+    "columbia": ["ManiDataset", "/path/to/columbia_mani"],
     "coverage": ["JsonDataset", "/path/to/coverage/paired_paths.json"],
-    "MOSE": ["VideoDataset", "/path/to/MOSE512", ["E2FGVI", "FuseFormer", "STTN"]]
+    "NIST2016": ["ManiDataset", "/path/to/NIST2016"],
+    "IMD2020": ["ManiDataset", "/path/to/IMD2020_1024"]
 }

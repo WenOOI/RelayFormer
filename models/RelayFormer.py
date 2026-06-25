@@ -89,11 +89,18 @@ class RelayFormer(nn.Module):
     """
     RelayFormer: unified local-global attention framework for image & video manipulation localization.
 
-    This is the optimized model (batched global attention + F.fold reconstruction + LoRA merging)
-    wired into the IMDLBenCo training/testing pipeline. The same `forward` serves three purposes:
+    Single `forward` serves three purposes:
       - training: when `mask` is provided, returns an output dict with `backward_loss`.
       - testing: same path (IMDLBenCo passes `mask`); the returned `pred_mask` is used by evaluators.
       - pure inference: when `mask` is None, returns the predicted mask tensor directly.
+
+    Performance design highlights (numerically identical, mode-aware):
+      - Patch reconstruction picks the path that's cheapest for its mode:
+          * training: channels-last slice-add (cheap autograd via slice-grad).
+          * inference / eval: F.fold (one fused kernel, no backward needed).
+      - The global-attention position_ids and key padding mask are built once per forward
+        and reused across all 12 transformer blocks.
+      - Image samples with only one valid patch take an identity short-circuit.
 
     Image-only / video-only / mixed training is handled entirely by the dataset; the model just
     sees a flattened batch of frames described by `clip_len` and `origin_shape`.
@@ -102,7 +109,7 @@ class RelayFormer(nn.Module):
                  input_size: int = 1024,
                  vit_model_name: str = 'vit_base_patch16_224',
                  vit_pretrain_path: str = '',
-                 tokens_per_patch: int = 2,
+                 tokens_per_patch: int = 3,
                  edge_lambda: int = 20,
                  grid_size: int = 0,
                  patch_size: int = 528,
@@ -144,7 +151,8 @@ class RelayFormer(nn.Module):
         # pretrained ImageNet weights so the (replaced) blocks still start from a good init.
         use_timm_pretrained = (vit_pretrain_path is None or vit_pretrain_path == '')
         vit = timm.create_model(vit_model_name, pretrained=use_timm_pretrained, num_classes=0,
-                                reg_tokens=1, drop_path_rate=0.1, dynamic_img_size=True,
+                                reg_tokens=max(tokens_per_patch - 1, 0),
+                                drop_path_rate=0.1, dynamic_img_size=True,
                                 no_embed_class=False)
         pretrained_state = vit.state_dict() if use_timm_pretrained else None
 
@@ -152,6 +160,7 @@ class RelayFormer(nn.Module):
         # qkv/proj/fc layers are preserved, so pretrained weights can be loaded afterwards).
         self.vit = replace_vit_modules(vit)
         self.feature_dim = self.vit.num_features
+        self.tpp = tokens_per_patch
 
         if use_timm_pretrained:
             # Re-load timm pretrained weights into the replaced blocks (LoRA params stay random).
@@ -160,7 +169,6 @@ class RelayFormer(nn.Module):
         else:
             self._load_vit_checkpoint(vit_pretrain_path)
 
-        self.tpp = tokens_per_patch
         # 0 -> auto-derive (1024 yields 2). Override to pin a fixed tiling at other resolutions.
         self.grid_size = grid_size if grid_size > 0 else input_size // 512
 
@@ -185,12 +193,15 @@ class RelayFormer(nn.Module):
         if 'pos_embed' in state_dict:
             ckpt_len = state_dict['pos_embed'].shape[1]
             model_len = self.vit.pos_embed.shape[1]
-            # Checkpoint lacks the register-token slot -> insert one after the cls token.
-            if ckpt_len == model_len - 1:
+            # Match the original experiment: insert register-token slots after
+            # the first `tokens_per_patch - 1` positional embeddings.
+            if ckpt_len < model_len:
                 orig_pos = state_dict['pos_embed']
                 embed_dim = orig_pos.shape[2]
-                new_pe = torch.randn(1, 1, embed_dim) * 0.02
-                state_dict['pos_embed'] = torch.cat([orig_pos[:, :1, :], new_pe, orig_pos[:, 1:, :]], dim=1)
+                new_pe = torch.randn(1, model_len - ckpt_len, embed_dim) * 0.02
+                insert_at = min(max(self.tpp - 1, 1), ckpt_len)
+                state_dict['pos_embed'] = torch.cat(
+                    [orig_pos[:, :insert_at, :], new_pe, orig_pos[:, insert_at:, :]], dim=1)
 
         missing, unexpected = self.vit.load_state_dict(state_dict, strict=False)
         print(f"[RelayFormer] Loaded ViT checkpoint from {path}. "
@@ -202,14 +213,95 @@ class RelayFormer(nn.Module):
             block.merge_lora()
 
     def divide_patches(self, x):
-        """Divide input image into patches using unfold. Returns (B, N, C, ph, pw)."""
-        patches = x.unfold(2, self.patch_size, self.stride).unfold(3, self.patch_size, self.stride)
+        """Divide input image into patches.
+
+        Training: Python loop with slice + stack — slice has cheap autograd whereas
+            unfold triggers a separate unfold_backward kernel during backward.
+        Inference: torch.unfold — a single fused kernel, no backward concerns.
+        """
+        ps = self.patch_size
+        if self.training:
+            B, C, H, W = x.shape
+            patches = []
+            for y in range(0, H - ps + 1, self.stride):
+                for x_pos in range(0, W - ps + 1, self.stride):
+                    patches.append(x[:, :, y:y+ps, x_pos:x_pos+ps])
+            return torch.stack(patches, dim=1)  # (B, N, C, ps, ps)
+        # Inference: unfold is faster (one kernel, no backward overhead to worry about).
+        patches = x.unfold(2, ps, self.stride).unfold(3, ps, self.stride)
         B, C, n_h, n_w, ph, pw = patches.shape
         return patches.permute(0, 2, 3, 1, 4, 5).reshape(B, n_h * n_w, C, ph, pw)
 
-    def _batched_global_attention(self, relay_tokens_list, sample_infos, block):
+    def _prepare_global_attn_context(self, sample_infos, device):
         """
-        Process relay tokens from all samples in a single batched forward pass.
+        Build, once per forward, the padded position_ids and attn_mask shared by every
+        transformer block in the global stage.
+
+        Returns:
+            lengths    : list[int] (relay-token length per sample)
+            max_len    : int
+            position_ids : LongTensor [4, B, max_len] or None for the single-sample short path
+            attn_mask  : FloatTensor [B, 1, max_len, max_len] or None for the single-sample short path
+        """
+        tpp = self.tpp
+        num_samples = len(sample_infos)
+        lengths = [info['num_patches'] * tpp for info in sample_infos]
+
+        # Single-sample short path: block accepts (valid, grid_size, clip_len) directly.
+        if num_samples == 1:
+            return lengths, lengths[0], None, None
+
+        max_len = max(lengths)
+
+        # ---- position_ids: build entirely on CPU with numpy, copy to device once ----
+        grid_size = self.grid_size
+        pid_np = np.zeros((4, num_samples, max_len), dtype=np.int64)
+        for i, info in enumerate(sample_infos):
+            T = info['clip_len']
+            valid = info['valid']
+            np_ = len(valid)
+            L = T * np_ * tpp
+
+            valid_arr = np.asarray(valid, dtype=np.int64)
+            r = valid_arr // grid_size
+            c = valid_arr % grid_size
+
+            # h_ids / w_ids: spatial coords, repeated tpp times then tiled T times
+            h_ids = np.tile(np.repeat(r, tpp), T)
+            w_ids = np.tile(np.repeat(c, tpp), T)
+            # t_ids: temporal index, repeated np_ * tpp times each
+            t_ids = np.repeat(np.arange(T, dtype=np.int64), np_ * tpp)
+            # tpp_ids: 0..tpp-1 repeated np_ times then tiled T times
+            tpp_ids = np.tile(np.tile(np.arange(tpp, dtype=np.int64), np_), T)
+
+            pid_np[0, i, :L] = t_ids
+            pid_np[1, i, :L] = tpp_ids
+            pid_np[2, i, :L] = h_ids
+            pid_np[3, i, :L] = w_ids
+
+        position_ids = torch.from_numpy(pid_np).to(device, non_blocking=True)
+
+        # ---- attn_mask: build on CPU, copy once.  -inf in the padded columns. ----
+        # mask[b, :, q, k] = -inf when k >= lengths[b]  (queries free, keys masked)
+        mask_np = np.zeros((num_samples, 1, max_len, max_len), dtype=np.float32)
+        neg_inf = np.float32('-inf')
+        for i, L in enumerate(lengths):
+            if L < max_len:
+                mask_np[i, 0, :, L:] = neg_inf
+        attn_mask = torch.from_numpy(mask_np).to(device, non_blocking=True)
+
+        return lengths, max_len, position_ids, attn_mask
+
+    def _batched_global_attention(self, relay_tokens_list, sample_infos, block,
+                                  lengths=None, max_len=None,
+                                  position_ids=None, attn_mask=None):
+        """
+        Run the global-attention block on relay tokens.
+
+        When called from `forward_features`, the caller passes pre-built `position_ids` and
+        `attn_mask` so they are constructed only once per forward (shared across blocks).
+        If they are not provided we fall back to per-call construction (kept for any
+        external caller that may still rely on the original API).
 
         Returns a list of processed tensors, each [num_patches_i, tpp, C].
         """
@@ -230,34 +322,26 @@ class RelayFormer(nn.Module):
         dtype = relay_tokens_list[0].dtype
         C = relay_tokens_list[0].shape[2]
 
-        lengths = [r.shape[1] for r in relay_tokens_list]
-        max_len = max(lengths)
+        if lengths is None or position_ids is None or attn_mask is None:
+            lengths, max_len, position_ids, attn_mask = self._prepare_global_attn_context(
+                sample_infos, device)
 
+        # Build the padded relay tensor.  Each relay_tokens_list[i] is [1, L_i, C].
         padded = torch.zeros(num_samples, max_len, C, device=device, dtype=dtype)
         for i, (r, l) in enumerate(zip(relay_tokens_list, lengths)):
             padded[i, :l] = r[0]
 
-        attn_mask = torch.zeros(num_samples, 1, max_len, max_len, device=device, dtype=dtype)
-        for i, l in enumerate(lengths):
-            if l < max_len:
-                attn_mask[i, :, :l, l:] = float('-inf')
-                attn_mask[i, :, l:, :] = 0
-
-        position_ids = torch.zeros(4, num_samples, max_len, device=device, dtype=torch.long)
-        for i, info in enumerate(sample_infos):
-            pid = build_4d_position_ids(
-                info['clip_len'], info['valid'], self.grid_size, tpp, device=device)
-            position_ids[:, i, :lengths[i]] = pid[:, 0, :]
+        # The attn_mask was prepared as float32; cast to the activation dtype if needed.
+        if attn_mask.dtype != dtype:
+            attn_mask = attn_mask.to(dtype)
 
         processed = block(
             padded, use_lora=1,
             attn_mask=attn_mask, position_ids_4d=position_ids
         )
 
-        results = []
-        for i, info in enumerate(sample_infos):
-            results.append(processed[i, :lengths[i]].view(info['num_patches'], tpp, C))
-        return results
+        return [processed[i, :lengths[i]].view(sample_infos[i]['num_patches'], tpp, C)
+                for i in range(num_samples)]
 
     def forward_features(self, patches_list, valid_patches_list, grid_hw_list, clip_len_list):
         """Process patches through the ViT and reconstruct features."""
@@ -278,6 +362,43 @@ class RelayFormer(nn.Module):
         B, N, C = x.shape
         tpp = self.tpp
         features = []
+        device = x.device
+
+        # ---- Hoist: per-sample layout is constant across the 12 transformer blocks. ----
+        # `layouts[i]` describes the i-th sample (which is one image or one video clip):
+        #   - (start, end)         : its slice in the flattened token batch
+        #   - num_patches          : patch_count * clip_len (= length / tpp)
+        #   - valid, grid_hw       : reconstruction metadata
+        #   - clip_len, patch_count
+        layouts = []
+        start_idx = 0
+        batch_idx = 0
+        video_batch = 0
+        while start_idx < x.shape[0]:
+            clip_len = clip_len_list[batch_idx].item()
+            patch_count = patch_counts[video_batch]
+            num_patches = patch_count * clip_len
+            end_idx = start_idx + num_patches
+            layouts.append({
+                'start': start_idx, 'end': end_idx,
+                'num_patches': num_patches, 'patch_count': patch_count,
+                'clip_len': clip_len,
+                'valid': valid_patches_list[video_batch],
+                'grid_hw': grid_hw_list[video_batch],
+            })
+            start_idx = end_idx
+            batch_idx += 1
+            video_batch += clip_len
+
+        # `sample_infos` is the subset needed by the global-attention path.
+        sample_infos = [
+            {'num_patches': L['num_patches'], 'valid': L['valid'], 'clip_len': L['clip_len']}
+            for L in layouts
+        ]
+
+        # ---- Hoist: build position_ids / attn_mask once, reuse in every block. ----
+        ga_lengths, ga_max_len, ga_pos_ids, ga_attn_mask = self._prepare_global_attn_context(
+            sample_infos, device)
 
         for i, blk in enumerate(self.vit.blocks):
             x = blk(x, use_lora=0, grid_size=self.grid_size)
@@ -285,42 +406,23 @@ class RelayFormer(nn.Module):
             # Phase 1: Collect relay tokens and reconstruct local tokens per sample
             relay_tokens_list = []
             loc_tokens_list = []
-            sample_infos = []
-
-            start_idx = 0
-            batch_idx = 0
-            video_batch = 0
-            while start_idx < x.shape[0]:
-                clip_len = clip_len_list[batch_idx].item()
-                patch_count = patch_counts[video_batch]
-                num_patches = patch_count * clip_len
-                end_idx = start_idx + num_patches
-
-                x_batch = x[start_idx:end_idx]
+            for L in layouts:
+                x_batch = x[L['start']:L['end']]
                 loc_x_i = x_batch[:, tpp:]
 
                 loc_reconstructed = self._reconstruct_multi_frame(
-                    loc_x_i, valid_patches_list[video_batch],
-                    grid_hw_list[video_batch], clip_len, patch_count)
+                    loc_x_i, L['valid'], L['grid_hw'], L['clip_len'], L['patch_count'])
                 loc_tokens_list.append(loc_reconstructed)
 
-                relay = x_batch[:, :tpp].contiguous().view(1, num_patches * tpp, C)
+                relay = x_batch[:, :tpp].contiguous().view(1, L['num_patches'] * tpp, C)
                 relay_tokens_list.append(relay)
 
-                sample_infos.append({
-                    'num_patches': num_patches,
-                    'valid': valid_patches_list[video_batch],
-                    'clip_len': clip_len,
-                })
-
-                start_idx = end_idx
-                batch_idx += 1
-                video_batch += clip_len
-
-            # Phase 2: Batched global attention on relay tokens
+            # Phase 2: Batched global attention on relay tokens (uses cached PE/mask).
             if i + 1 < len(self.vit.blocks):
                 processed_relays = self._batched_global_attention(
-                    relay_tokens_list, sample_infos, self.vit.blocks[i+1])
+                    relay_tokens_list, sample_infos, self.vit.blocks[i+1],
+                    lengths=ga_lengths, max_len=ga_max_len,
+                    position_ids=ga_pos_ids, attn_mask=ga_attn_mask)
             else:
                 processed_relays = [r.squeeze(0).view(info['num_patches'], tpp, C)
                                     for r, info in zip(relay_tokens_list, sample_infos)]
@@ -380,50 +482,141 @@ class RelayFormer(nn.Module):
         W = self.feature_patch_size if grid_w == 1 else grid_w * self.feature_stride + self.feature_overlap * 2
         return H, W
 
-    def reconstruct_from_overlap_patches(self, patches, valid_indices, grid_hw, for_decode=False):
-        """Reconstruct feature map from overlapping patches using F.fold."""
-        num_patches, N, C = patches.shape
+    def _get_count_tensor(self, grid_hw, patch_count, device, dtype):
+        """
+        Return (and cache) the count tensor used for averaging overlapping patches.
+        Shape: (1, H, W) so it broadcasts to (C, H, W) (slice-add path) and (1, 1, H, W)
+        (F.fold path).  Depends only on (grid_hw, patch_count, dtype).
+        """
+        cache = getattr(self, "_count_cache", None)
+        if cache is None:
+            cache = {}
+            self._count_cache = cache
+        key = (grid_hw, patch_count, dtype)
+        cached = cache.get(key)
+        if cached is not None and cached.device == device:
+            return cached
         fp = self.feature_patch_size
         H, W = self._get_recon_dims(grid_hw)
+        grid_h, grid_w = grid_hw
+        count = torch.zeros(1, H, W, device=device, dtype=dtype)
+        # Iterate canonical patch positions: get_valid_patches_info produces
+        # valid_indices = [i*grid_size + j for i in range(grid_h) for j in range(grid_w)],
+        # so k-th patch sits at (row=k // grid_w, col=k % grid_w).
+        for k in range(patch_count):
+            row = k // grid_w
+            col = k % grid_w
+            y = row * self.feature_stride
+            x = col * self.feature_stride
+            count[0, y:y+fp, x:x+fp] += 1
+        count = torch.clamp(count, min=1.0)
+        cache[key] = count
+        return count
 
+    def reconstruct_from_overlap_patches(self, patches, valid_indices, grid_hw, for_decode=False):
+        """
+        Reconstruct feature map from overlapping patches.
+
+        Two code paths with identical numerics:
+          - training (self.training=True): slice-add.  Many small ops in fwd but autograd
+            uses cheap slice-grad in bwd.  Avoids F.fold's slow im2col backward kernel.
+          - inference: F.fold.  Single big kernel, no backward needed.
+        """
+        num_patches, N, C = patches.shape
+        fp = self.feature_patch_size
+
+        # Single-patch fast path: round-trip is identity.
+        if num_patches == 1:
+            if for_decode:
+                return patches.view(1, fp, fp, C).permute(0, 3, 1, 2)
+            return patches
+
+        H, W = self._get_recon_dims(grid_hw)
+
+        if self.training:
+            # Slice-add in channels-last (H, W, C) layout: per-patch view is zero-copy and
+            # in-place += fuses into a single add_ kernel.  This is much cheaper to backprop
+            # through than F.fold (whose backward triggers an im2col kernel per call).
+            recon = patches.new_zeros(H, W, C)
+            for k in range(num_patches):
+                row = valid_indices[k] // self.grid_size
+                col = valid_indices[k] % self.grid_size
+                y = row * self.feature_stride
+                x = col * self.feature_stride
+                recon[y:y+fp, x:x+fp, :] += patches[k].view(fp, fp, C)
+            count = self._get_count_tensor(grid_hw, num_patches, patches.device, patches.dtype)
+            recon = recon / count.squeeze(0).unsqueeze(-1)   # (H, W, 1) broadcast over C
+            recon_chw = recon.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
+            if for_decode:
+                return recon_chw
+            patches_reconstructed = self.divide_feature_patches(recon_chw)
+            return patches_reconstructed.view(num_patches, C, N).permute(0, 2, 1)
+
+        # Inference: F.fold path (no backward; one big kernel).
         fold_input = (patches.view(num_patches, fp, fp, C)
                       .permute(3, 1, 2, 0)
                       .reshape(1, C * fp * fp, num_patches))
-
         recon = F.fold(fold_input, output_size=(H, W), kernel_size=fp, stride=self.feature_stride)
-
-        ones = torch.ones(1, fp * fp, num_patches, device=patches.device, dtype=patches.dtype)
-        count = F.fold(ones, output_size=(H, W), kernel_size=fp, stride=self.feature_stride)
-        recon = recon / torch.clamp(count, min=1.0)
-
+        recon = recon / self._get_count_tensor(grid_hw, num_patches, patches.device, patches.dtype).unsqueeze(0)
         if for_decode:
             return recon
-
         patches_reconstructed = self.divide_feature_patches(recon)
         return patches_reconstructed.view(num_patches, C, N).permute(0, 2, 1)
 
     def _reconstruct_multi_frame(self, patches, valid_indices, grid_hw, clip_len, patch_count):
-        """Batched reconstruction for multiple frames sharing the same grid layout."""
+        """Batched reconstruction sharing the same grid layout across frames.
+
+        Training: slice-add (cheap bwd).  Inference: F.fold (one kernel).
+        """
         N, C = patches.shape[1], patches.shape[2]
         fp = self.feature_patch_size
+
+        if patch_count == 1:
+            return patches
+
         H, W = self._get_recon_dims(grid_hw)
 
+        if self.training:
+            # Channels-last slice-add for video clips.  View into (clip_len, K, fp, fp, C)
+            # is zero-copy; recon in (clip_len, H, W, C) takes in-place += per patch.
+            patches_5d = patches.view(clip_len, patch_count, fp, fp, C)
+            recon = patches.new_zeros(clip_len, H, W, C)
+            for k in range(patch_count):
+                row = valid_indices[k] // self.grid_size
+                col = valid_indices[k] % self.grid_size
+                y = row * self.feature_stride
+                x = col * self.feature_stride
+                recon[:, y:y+fp, x:x+fp, :] += patches_5d[:, k]
+            count = self._get_count_tensor(grid_hw, patch_count, patches.device, patches.dtype)
+            recon = recon / count.squeeze(0).unsqueeze(-1)        # (H, W, 1) broadcast
+            recon_chw = recon.permute(0, 3, 1, 2).contiguous()    # (clip_len, C, H, W)
+            patches_out = self.divide_feature_patches(recon_chw)
+            return patches_out.reshape(clip_len * patch_count, C, N).permute(0, 2, 1)
+
+        # Inference path.
         fold_input = (patches.view(clip_len, patch_count, fp, fp, C)
                       .permute(0, 4, 2, 3, 1)
                       .reshape(clip_len, C * fp * fp, patch_count))
-
         recon = F.fold(fold_input, output_size=(H, W), kernel_size=fp, stride=self.feature_stride)
-
-        ones = torch.ones(1, fp * fp, patch_count, device=patches.device, dtype=patches.dtype)
-        count = F.fold(ones, output_size=(H, W), kernel_size=fp, stride=self.feature_stride)
-        recon = recon / torch.clamp(count, min=1.0)
-
+        recon = recon / self._get_count_tensor(grid_hw, patch_count, patches.device, patches.dtype).unsqueeze(0)
         patches_out = self.divide_feature_patches(recon)
         return patches_out.reshape(clip_len * patch_count, C, N).permute(0, 2, 1)
 
     def divide_feature_patches(self, x):
-        """Divide feature map into feature patches using unfold."""
+        """Divide feature map into feature patches.
+
+        Training: Python loop + slice + stack — slice's backward is cheap.
+        Inference: torch.unfold — one fused kernel; no autograd cost.
+        """
         fp = self.feature_patch_size
+        if self.training:
+            B, C, H, W = x.shape
+            patches = []
+            for y in range(0, H - fp + 1, self.feature_stride):
+                for x_pos in range(0, W - fp + 1, self.feature_stride):
+                    patches.append(x[:, :, y:y+fp, x_pos:x_pos+fp])
+            return torch.stack(patches, dim=1)  # (B, N, C, fp, fp)
+        # Inference: unfold (single kernel, no backward).
         patches = x.unfold(2, fp, self.feature_stride).unfold(3, fp, self.feature_stride)
         B, C, n_h, n_w, ph, pw = patches.shape
         return patches.permute(0, 2, 3, 1, 4, 5).reshape(B, n_h * n_w, C, ph, pw)
@@ -449,22 +642,27 @@ class RelayFormer(nn.Module):
 
         return full_masks
 
-    def forward(self, image, clip, origin_shape, clip_len,
+    def forward(self, image, clip=None, origin_shape=None, clip_len=None,
                 mask=None, edge_mask=None, label=None, *args, **kwargs):
         """
         Args:
-            image:        (B, C, H, W) middle/representative frame per sample (assembled batch).
-            clip:         (B, C, H, W) frames flattened across the batch.
+            image:        (sum_T, C, H, W) flattened frame batch.  Same tensor as `clip`
+                          if the caller did not split image/clip.
+            clip:         (sum_T, C, H, W) frames flattened across the batch.  When None
+                          we alias it to `image` (cheap; no copy).  The collate_fn returns
+                          only `image` for memory & H2D efficiency.
             origin_shape: (B, 2) original (H, W) per sample.
             clip_len:     (num_samples,) frames-per-sample; 1 for images, T for video clips.
-            mask:         (B, 1, H, W) ground-truth mask. If None -> pure inference mode.
-            edge_mask:    (B, 1, H, W) optional edge weight map for the edge-aware loss.
+            mask:         (sum_T, 1, H, W) ground-truth mask. If None -> pure inference mode.
+            edge_mask:    (sum_T, 1, H, W) optional edge weight map for the edge-aware loss.
 
         Returns:
             - dict (IMDLBenCo output interface) when `mask` is provided.
             - predicted mask tensor (B, 1, H, W) when `mask` is None.
         """
         grid_size = self.grid_size
+        if clip is None:
+            clip = image                              # alias when caller omits clip
         patches = self.divide_patches(clip)
         valid_patches_list, max_valid_patches, grid_hw_list = self.get_valid_patches_info(
             origin_shape, self.input_size, grid_size, clip_len=clip_len)

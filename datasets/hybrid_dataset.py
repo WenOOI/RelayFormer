@@ -17,7 +17,6 @@ Config format (list of entries):
 """
 import os
 import json
-import random
 from glob import glob
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -59,8 +58,15 @@ class EdgeMaskGenerator(torch.nn.Module):
 
 
 def pil_loader(path):
-    """PIL image loader."""
-    return Image.open(path).convert('RGB')
+    """PIL image loader.
+
+    Open via a file handle that is closed before `convert()` decodes (matches
+    IMDLBenCo's loader).  Avoids PIL's lazy-fd behaviour which causes repeated
+    syscalls and worker contention under multi-process DataLoader.
+    """
+    with open(path, 'rb') as f:
+        img = Image.open(f)
+        return img.convert('RGB')
 
 
 def get_albu_transforms(type_: str, output_size: Tuple[int, int]):
@@ -324,7 +330,8 @@ class MixedImageVideoDataset(Dataset):
 
     # ----------------------------------------------------------- item builders
     def _process_image_as_video(self, sample: Dict) -> Dict[str, Any]:
-        """Load an image sample and wrap it as a single-frame clip (T=1)."""
+        """Load an image sample. Returns plain (C, H, W) tensors; the collate_fn
+        promotes a single-frame batch via torch.stack."""
         tp_path = sample['tp_path']
         gt_path = sample['gt_path']
 
@@ -368,26 +375,25 @@ class MixedImageVideoDataset(Dataset):
 
         final_shape = self.output_size if self.is_resizing else tp_shape
 
+        # Plain per-frame tensors; the collate_fn will stack or cat depending on layout.
         data_dict = {
-            'image': tp_img.unsqueeze(0).to(torch.float),   # 1 C H W (T=1)
-            'mask': gt_img.unsqueeze(0),                     # 1 1 H W (T=1)
-            'label': torch.tensor([label]),
-            'clip_len': torch.tensor(1),
-            'origin_shape': torch.tensor(tp_shape),
+            'image': tp_img.to(torch.float),           # C H W
+            'mask':  gt_img,                            # 1 H W
+            'label': torch.tensor(label),               # scalar
+            'clip_len': torch.tensor(1),                # scalar; image == 1-frame clip
+            'origin_shape': torch.tensor(tp_shape),     # (2,)
             'shape': torch.tensor(final_shape),
-            'name': [os.path.basename(tp_path)],
-            'stage': self.split,
-            'dataset_type': sample['dataset_type'],
-            'dataset_path': sample['dataset_path'],
+            'name': os.path.basename(tp_path),
+            '_T': 1,                                    # marker used by collate_fn
         }
 
         if self.edge_mask_generator is not None:
-            data_dict['edge_mask'] = res_dict['masks'][1].unsqueeze(0).unsqueeze(0)  # 1 1 H W
+            data_dict['edge_mask'] = res_dict['masks'][1].unsqueeze(0)  # 1 H W
 
         if self.is_padding:
             shape_mask = torch.zeros_like(gt_img)
             shape_mask[:, :tp_shape[0], :tp_shape[1]] = 1
-            data_dict['shape_mask'] = shape_mask.unsqueeze(0)
+            data_dict['shape_mask'] = shape_mask        # 1 H W
 
         return data_dict
 
@@ -458,17 +464,16 @@ class MixedImageVideoDataset(Dataset):
         video_name = (os.path.basename(os.path.dirname(clip_paths[0]))
                       + os.path.basename(clip_paths[0]).split('.')[0])
 
+        # Per-frame tensors live in (T, *) layout; collate_fn handles per-sample T.
         data_dict = {
             'image': torch.stack(transformed_imgs, dim=0),   # T C H W
             'mask': torch.stack(mask_tensors, dim=0),        # T 1 H W
-            'label': torch.tensor(labels),                   # T
+            'label': torch.tensor(labels[0]),                # representative scalar
             'clip_len': torch.tensor(self.clip_len),
             'origin_shape': torch.tensor(tp_shape),
             'shape': torch.tensor(tp_shape),
-            'name': [video_name] * len(transformed_imgs),
-            'stage': self.split,
-            'dataset_type': sample['dataset_type'],
-            'dataset_path': sample['dataset_path'],
+            'name': video_name,
+            '_T': self.clip_len,
         }
 
         if self.edge_mask_generator is not None:
@@ -494,7 +499,8 @@ class MixedImageVideoDataset(Dataset):
         self._len = total_image_samples + total_video_samples
 
         if self.split == 'train':
-            # Flatten (type, dataset_idx, sample_idx) and shuffle once.
+            # Flatten (type, dataset_idx, sample_idx). The DataLoader sampler owns shuffling,
+            # matching IMDLBenCo's dataset behavior and keeping DDP epochs reproducible.
             self.all_samples_indices = []
             for dataset_idx, dataset_samples in enumerate(self.image_datasets_samples):
                 for i in range(len(dataset_samples)):
@@ -502,7 +508,6 @@ class MixedImageVideoDataset(Dataset):
             for dataset_idx, dataset_samples in enumerate(self.video_datasets_samples):
                 for i in range(len(dataset_samples)):
                     self.all_samples_indices.append(('video', dataset_idx, i))
-            random.shuffle(self.all_samples_indices)
             print("Training mode sampling setup:")
             print(f"  Image datasets: {num_image_datasets}, total samples: {total_image_samples}")
             print(f"  Video datasets: {num_video_datasets}, total samples: {total_video_samples}")
@@ -556,32 +561,58 @@ class MixedImageVideoDataset(Dataset):
     @staticmethod
     def collate_fn(batch):
         """
-        Flatten a batch of variable-length clips into a frame batch.
+        Flatten variable-length clips (image -> T=1, video -> T=clip_len) into a single
+        frame batch.  Per-sample items returned by `_process_image_as_video` are 3D
+        ((C,H,W) / (1,H,W)); video items are 4D ((T,C,H,W)).
+
+        Fast path: when every sample is a single image, use torch.stack (avoids the
+        ~36% extra cost of cat-with-3D-tensors via Python list iteration).  Mixed or
+        pure-video batches fall back to the general per-sample unsqueeze+cat path.
 
         Returns a dict with:
-          - clip / image : (sum_T, C, H, W) all frames concatenated
+          - image        : (sum_T, C, H, W) flattened frames
           - mask         : (sum_T, 1, H, W)
           - clip_len     : (B,) frames-per-sample
           - origin_shape : (B, 2)
           - label        : (B,) representative (first-frame) label per sample
         """
-        labels = [sample['label'][0] for sample in batch]
-        origin_shapes = [sample['origin_shape'] for sample in batch]
+        first = batch[0]
+        all_image = all(s.get('_T', 1) == 1 for s in batch)
 
+        if all_image:
+            # 3D per-sample tensors -> single stack call per modality.
+            image = torch.stack([s['image'] for s in batch], dim=0)
+            mask  = torch.stack([s['mask']  for s in batch], dim=0)
+            result = {
+                'image': image,
+                'mask':  mask,
+                'label': torch.stack([s['label'] for s in batch]),
+                'clip_len': torch.stack([s['clip_len'] for s in batch]),
+                'origin_shape': torch.stack([s['origin_shape'] for s in batch]),
+            }
+            if 'edge_mask' in first:
+                result['edge_mask'] = torch.stack([s['edge_mask'] for s in batch], dim=0)
+            if 'shape_mask' in first:
+                result['shape_mask'] = torch.stack([s['shape_mask'] for s in batch], dim=0)
+            return result
+
+        # Mixed image+video batch: promote 3D samples to 4D (T=1) then cat along T.
+        def _as_T(t):
+            return t.unsqueeze(0) if t.dim() == 3 else t
+
+        image_cat = torch.cat([_as_T(s['image']) for s in batch], dim=0)
+        mask_cat  = torch.cat([_as_T(s['mask'])  for s in batch], dim=0)
         result = {
-            'clip': torch.cat([sample['image'] for sample in batch]),
-            'image': torch.cat([sample['image'] for sample in batch]),
-            'mask': torch.cat([sample['mask'] for sample in batch]),
-            'label': torch.tensor(labels),
-            'clip_len': torch.stack([sample['clip_len'] for sample in batch]),
-            'origin_shape': torch.stack(origin_shapes),
-            'name': [sample['name'] for sample in batch],
-            'stage': batch[0]['stage'],
+            'image': image_cat,
+            'mask':  mask_cat,
+            'label': torch.stack([s['label'] for s in batch]),
+            'clip_len': torch.stack([s['clip_len'] for s in batch]),
+            'origin_shape': torch.stack([s['origin_shape'] for s in batch]),
         }
-        if 'edge_mask' in batch[0]:
-            result['edge_mask'] = torch.cat([sample['edge_mask'] for sample in batch])
-        if 'shape_mask' in batch[0]:
-            result['shape_mask'] = torch.cat([sample['shape_mask'] for sample in batch])
+        if 'edge_mask' in first:
+            result['edge_mask'] = torch.cat([_as_T(s['edge_mask']) for s in batch], dim=0)
+        if 'shape_mask' in first:
+            result['shape_mask'] = torch.cat([_as_T(s['shape_mask']) for s in batch], dim=0)
         return result
 
     def __len__(self) -> int:

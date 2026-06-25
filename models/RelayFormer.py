@@ -158,7 +158,9 @@ class RelayFormer(nn.Module):
 
         # Replace stock blocks with LoRA + 4D-RoPE blocks (parameter names for the shared
         # qkv/proj/fc layers are preserved, so pretrained weights can be loaded afterwards).
-        self.vit = replace_vit_modules(vit)
+        # `token_per_patch` is forwarded so the block's single-sample RoPE path uses the
+        # right relay-token count.
+        self.vit = replace_vit_modules(vit, token_per_patch=tokens_per_patch)
         self.feature_dim = self.vit.num_features
         self.tpp = tokens_per_patch
 

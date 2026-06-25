@@ -547,14 +547,15 @@ class Block(nn.Module):
         drop_path: float = 0.0,
         act_layer: Type[nn.Module] = nn.GELU,
         norm_layer: Type[nn.Module] = nn.LayerNorm,
-        mlp_layer: Type[nn.Module] = Mlp
+        mlp_layer: Type[nn.Module] = Mlp,
+        token_per_patch: int = 2,
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_norm=qk_norm,
             proj_bias=proj_bias, attn_drop=attn_drop, proj_drop=proj_drop,
-            norm_layer=norm_layer
+            norm_layer=norm_layer, token_per_patch=token_per_patch,
         )
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -596,7 +597,13 @@ class Block(nn.Module):
         return x
 
 
-def replace_vit_modules(model, dropout=0., drop_path_rate=0.1, custom_block_class=Block, depth=12):
+def replace_vit_modules(model, dropout=0., drop_path_rate=0.1, custom_block_class=Block,
+                        depth=12, token_per_patch=2):
+    """Replace the stock ViT blocks with the LoRA / 4D-RoPE Block class.
+
+    `token_per_patch` is forwarded into each Block (and from there into its Attention)
+    so that the single-sample RoPE short-circuit uses the right relay-token count.
+    """
     dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
 
     for i, block in enumerate(model.blocks):
@@ -619,7 +626,8 @@ def replace_vit_modules(model, dropout=0., drop_path_rate=0.1, custom_block_clas
             attn_drop=attn_drop,
             drop_path=drop_path,
             act_layer=act_layer,
-            norm_layer=norm_layer
+            norm_layer=norm_layer,
+            token_per_patch=token_per_patch,
         )
 
         model.blocks[i] = new_block

@@ -75,14 +75,14 @@ pip install -r requirements.txt
 
 **RelayFormer checkpoints**
 
-- **Paper weights** — [download](https://drive.google.com/file/d/1CFxwkVAB6_Qq-A8VJlYXJdcABJ26r7xJ/view?usp=drive_link).
+- **Paper weights** — [download](https://huggingface.co/Wenn11/RelayFormer/tree/main).
   Trained on CASIAv2.0 (images) and the DAVIS2016 inpainting dataset (videos), so the model handles
   arbitrary image and video inputs. In the paper, the two modalities were trained independently to
   ensure a fair comparison and avoid cross-task interference; further tests show joint training has
   minimal impact on performance. These weights are intended primarily for reproducing the paper.
 - **Application-oriented weights** — [download](https://drive.google.com/file/d/1vLIxt_2xdGoI2voFMOFKsHCpU7EZG3qE/view?usp=sharing).
   Trained on a larger, more diverse dataset for better generalization and robustness across a wider
-  range of real-world images and videos.
+  range of real-world images and videos. **Note** this version was trained under the setting: tokens_per_patch = 2.
 
 ---
 

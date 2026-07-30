@@ -1,0 +1,3 @@
+{
+    "MOSE": ["VideoDataset", "/data/huangwen/worklab/ps-detection/datasets/MOSE100", ["E2FGVI", "FuseFormer", "STTN"]]
+}

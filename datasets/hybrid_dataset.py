@@ -237,7 +237,9 @@ class MixedImageVideoDataset(Dataset):
                         continue
 
                     if self.split == 'test':
-                        starts = [0, self.clip_len - 1, max(0, len(frames) - self.clip_len)]
+                        # Non-overlapping clips of length clip_len, matching the reference
+                        # VideoFrameDataset used to produce the released checkpoint's eval log.
+                        starts = list(range(0, len(frames) - self.clip_len + 1, self.clip_len))
                     else:
                         starts = list(range(0, max(0, len(frames) - self.clip_len), self.clip_len))
 

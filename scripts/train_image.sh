@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pure IMAGE training, aligned with the original RelayFormer image experiment.
-base_dir="./output_dir"
+base_dir="./output_dir_release_v1"
 mkdir -p ${base_dir}
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 \

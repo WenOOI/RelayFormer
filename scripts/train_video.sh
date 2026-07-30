@@ -19,7 +19,7 @@ torchrun \
     --epochs 200 \
     --lr 1e-4 \
     --min_lr 5e-7 \
-    --vit_pretrain_path /data/huangwen/worklab/ps-detection/vit_base_patch16_224.mae.bin \
+    --vit_pretrain_path /path/to/vit_base_patch16_224.mae.bin \
     --image_size 512 \
     --patch_size 272 \
     --feature_patch_size 17 \

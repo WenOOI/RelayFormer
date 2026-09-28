@@ -1,37 +1,35 @@
 """
 Mixed image / video dataset for RelayFormer manipulation localization.
-
 A single dataset class drives all three training modes:
   - pure image  : pass only `image_datasets`
   - pure video  : pass only `video_datasets`
   - mixed       : pass both
-
 Images are treated as single-frame clips (clip_len=1); videos as clips of `clip_len`
 frames. `collate_fn` flattens everything into a frame batch plus a per-sample `clip_len`
 vector, which is exactly what `RelayFormer.forward` expects.
-
 Config format (list of entries):
   ["ManiDataset", "/path/to/dir"]                 # image dir with Tp/ and Gt/
   ["JsonDataset", "/path/to/list.json"]           # image list: [[tp, gt], ...]
   ["VideoDataset", "/path/to/dir", ["m1", "m2"]]  # video dir + manipulation methods
 """
-import os
 import json
+import os
 from glob import glob
-from typing import List, Tuple, Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
+import albumentations as A
 import cv2
 import numpy as np
 import torch
+from albumentations.pytorch import ToTensorV2
+from PIL import Image
 from torch.nn import functional as F
 from torch.utils.data import Dataset
-from PIL import Image
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
 
 
 class EdgeMaskGenerator(torch.nn.Module):
     """Generate the 'edge bar' for a binary mask using morphological dilation and difference."""
+
     def __init__(self, kernel_size: int = 3) -> None:
         super().__init__()
         assert kernel_size % 2 == 1, "Kernel size must be odd"
@@ -59,7 +57,6 @@ class EdgeMaskGenerator(torch.nn.Module):
 
 def pil_loader(path):
     """PIL image loader.
-
     Open via a file handle that is closed before `convert()` decodes (matches
     IMDLBenCo's loader).  Avoids PIL's lazy-fd behaviour which causes repeated
     syscalls and worker contention under multi-process DataLoader.
@@ -111,16 +108,15 @@ class MixedImageVideoDataset(Dataset):
                  post_funcs=None,
                  image_transforms=None,   # albumentations transform for images
                  video_transforms=None,   # albumentations transform for video frames
+                 video_train_repeat: int = 16,
                  ) -> None:
         super().__init__()
-
         if is_padding and is_resizing:
             raise AttributeError("is_padding and is_resizing can not be True at the same time")
         if not is_padding and not is_resizing:
             raise AttributeError("is_padding and is_resizing can not be False at the same time")
         if image_datasets is None and video_datasets is None:
             raise ValueError("At least one of image_datasets or video_datasets must be provided")
-
         self.split = split
         self.clip_len = clip_len
         self.is_padding = is_padding
@@ -128,26 +124,31 @@ class MixedImageVideoDataset(Dataset):
         self.output_size = output_size
         self.img_loader = img_loader
         self.post_funcs = post_funcs
-
+        self.video_train_repeat = video_train_repeat
+        # Only pure-video training changes sampling behavior. Image-only, mixed,
+        # validation/test paths keep their original behavior.
+        self._pure_video_train = (
+            self.split == 'train'
+            and image_datasets is None
+            and video_datasets is not None
+        )
         # Samples grouped per source dataset.
         self.image_datasets_samples: List[List[Dict]] = []
         self.video_datasets_samples: List[List[Dict]] = []
         self.image_dataset_names: List[str] = []
         self.video_dataset_names: List[str] = []
-
         self._init_datasets(image_datasets, video_datasets)
         self._setup_transforms(image_transforms, video_transforms)
         self.edge_mask_generator = None if edge_width is None else EdgeMaskGenerator(edge_width)
         self._setup_sampling()
-
         total_image_samples = sum(len(s) for s in self.image_datasets_samples)
         total_video_samples = sum(len(s) for s in self.video_datasets_samples)
         print("Dataset initialized:")
         print(f"  Image datasets: {len(self.image_datasets_samples)}, total samples: {total_image_samples}")
         print(f"  Video datasets: {len(self.video_datasets_samples)}, total samples: {total_video_samples}")
         print(f"  Epoch length: {self._len}")
-
     # ------------------------------------------------------------------ init
+
     def _init_datasets(self, image_datasets, video_datasets):
         if image_datasets is not None:
             for dataset_config in image_datasets:
@@ -162,7 +163,6 @@ class MixedImageVideoDataset(Dataset):
                     raise ValueError(f"Unknown image dataset type: {dataset_type}")
                 self.image_datasets_samples.append(dataset_samples)
                 self.image_dataset_names.append(f"{dataset_type}:{dataset_path}")
-
         if video_datasets is not None:
             for dataset_config in video_datasets:
                 dataset_type, dataset_path, video_methods = dataset_config
@@ -179,7 +179,6 @@ class MixedImageVideoDataset(Dataset):
         if not (os.path.exists(tp_dir) and os.path.exists(gt_dir)):
             print(f"Warning: ManiDataset directories not found: {tp_dir} or {gt_dir}")
             return
-
         exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff')
         tp_files = sorted(f for f in os.listdir(tp_dir) if f.lower().endswith(exts))
         gt_files = sorted(f for f in os.listdir(gt_dir) if f.lower().endswith(exts))
@@ -223,7 +222,6 @@ class MixedImageVideoDataset(Dataset):
             datatype = 'MOSE' if 'MOSE' in video_path else 'Splice'
             fake = 'frame' if datatype == 'MOSE' else 'fake'
             mask_name = 'groundtruth' if datatype == 'MOSE' else 'mask'
-
             for method in video_methods:
                 fake_dir = os.path.join(video_path, method, fake)
                 if not os.path.isdir(fake_dir):
@@ -235,14 +233,22 @@ class MixedImageVideoDataset(Dataset):
                     frames = sorted(glob(os.path.join(frame_dir, '*.png')))
                     if len(frames) < self.clip_len:
                         continue
-
+                    if self._pure_video_train:
+                        # Pure-video train: keep one source item per video and sample a
+                        # fresh contiguous clip in __getitem__, matching the old
+                        # VideoFrameDataset training semantics while preserving masks/layouts.
+                        dataset_samples.append({
+                            'type': 'video', 'dataset_type': datatype, 'dataset_path': video_path,
+                            'mode': 'video', 'frames': frames, 'video': video,
+                            'mask_name': mask_name, 'method': method,
+                        })
+                        continue
                     if self.split == 'test':
                         # Non-overlapping clips of length clip_len, matching the reference
                         # VideoFrameDataset used to produce the released checkpoint's eval log.
                         starts = list(range(0, len(frames) - self.clip_len + 1, self.clip_len))
                     else:
                         starts = list(range(0, max(0, len(frames) - self.clip_len), self.clip_len))
-
                     for i in starts:
                         clip = frames[i:i + self.clip_len]
                         if len(clip) != self.clip_len:
@@ -269,12 +275,16 @@ class MixedImageVideoDataset(Dataset):
                     frames = sorted(glob(os.path.join(frame_dir, '*.jpg')))
                     if len(frames) < self.clip_len:
                         continue
-
+                    if self._pure_video_train:
+                        dataset_samples.append({
+                            'type': 'video', 'dataset_type': 'Other', 'dataset_path': video_path,
+                            'mode': 'video', 'frames': frames, 'video': video, 'method': method,
+                        })
+                        continue
                     if self.split == 'test':
                         starts = list(range(min(10, len(frames) - self.clip_len + 1)))
                     else:
                         starts = list(range(0, max(0, len(frames) - self.clip_len), self.clip_len))[:2]
-
                     for i in starts:
                         clip = frames[i:i + self.clip_len]
                         if len(clip) != self.clip_len:
@@ -284,17 +294,15 @@ class MixedImageVideoDataset(Dataset):
                             'type': 'video', 'dataset_type': 'Other', 'dataset_path': video_path,
                             'mode': 'clip', 'clip_paths': clip, 'mask_paths': masks, 'method': method,
                         })
-
     # -------------------------------------------------------------- transforms
+
     def _setup_transforms(self, image_transforms, video_transforms):
         # Final padding / resizing transform (shared layout for images).
         if self.is_padding:
             self.post_transform = get_albu_transforms(type_="pad", output_size=self.output_size)
         else:
             self.post_transform = get_albu_transforms(type_="resize", output_size=self.output_size)
-
         self.image_transforms = image_transforms
-
         # Video resize/pad applied before normalization.
         if self.is_padding:
             self.video_before_trans = A.Compose([
@@ -303,7 +311,6 @@ class MixedImageVideoDataset(Dataset):
             ])
         else:
             self.video_before_trans = A.Compose([A.Resize(self.output_size[0], self.output_size[1])])
-
         if video_transforms is None:
             if self.is_padding:
                 base_transforms = [
@@ -316,7 +323,6 @@ class MixedImageVideoDataset(Dataset):
                     A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                     ToTensorV2(transpose_mask=True),
                 ]
-
             if self.split == 'train':
                 train_transforms = [
                     A.HorizontalFlip(p=0.5),
@@ -326,23 +332,20 @@ class MixedImageVideoDataset(Dataset):
                 self.video_data_transform = A.ReplayCompose(train_transforms)
             else:
                 self.video_data_transform = None
-
             self.video_base_transform = A.Compose(base_transforms)
         else:
             self.video_data_transform = None
             self.video_base_transform = video_transforms
-
     # ----------------------------------------------------------- item builders
+
     def _process_image_as_video(self, sample: Dict) -> Dict[str, Any]:
         """Load an image sample. Returns plain (C, H, W) tensors; the collate_fn
         promotes a single-frame batch via torch.stack."""
         tp_path = sample['tp_path']
         gt_path = sample['gt_path']
-
         tp_img = self.img_loader(tp_path)
         tp_shape = tp_img.size
         tp_img = np.array(tp_img)  # H W C
-
         if gt_path != "Negative":
             gt_img = self.img_loader(gt_path)
             gt_shape = gt_img.size
@@ -352,33 +355,25 @@ class MixedImageVideoDataset(Dataset):
             gt_img = np.zeros((tp_img.shape[0], tp_img.shape[1], 3))
             gt_shape = (tp_img.shape[1], tp_img.shape[0])
             label = 0
-
         assert tp_shape == gt_shape, (
             f"tp and gt image shape must be the same, but got {tp_shape} and {gt_shape} "
             f"for '{tp_path}' and '{gt_path}'. Please check it!")
-
         if self.image_transforms is not None:
             res_dict = self.image_transforms(image=tp_img, mask=gt_img)
             tp_img = res_dict['image']
             gt_img = res_dict['mask']
             label = 0 if np.all(gt_img == 0) else 1
-
         tp_shape = tp_img.shape[0:2]  # H, W
-
         gt_img = (np.mean(gt_img, axis=2, keepdims=True) > 127.5) * 1.0
         gt_img = gt_img.transpose(2, 0, 1)[0]  # H W
         masks_list = [gt_img]
-
         if self.edge_mask_generator is not None:
             gt_img_edge = self.edge_mask_generator(torch.from_numpy(gt_img).float())[0]
             masks_list.append(gt_img_edge.numpy())
-
         res_dict = self.post_transform(image=tp_img, masks=masks_list)
         tp_img = res_dict['image']
         gt_img = res_dict['masks'][0].unsqueeze(0)  # 1 H W
-
         final_shape = self.output_size if self.is_resizing else tp_shape
-
         # `origin_shape` drives `get_valid_patches_info`, which decides how much of the
         # `input_size x input_size` canvas the model populates.  It must match what the
         # model actually sees:
@@ -400,22 +395,18 @@ class MixedImageVideoDataset(Dataset):
             'name': os.path.basename(tp_path),
             '_T': 1,                                    # marker used by collate_fn
         }
-
         if self.edge_mask_generator is not None:
             data_dict['edge_mask'] = res_dict['masks'][1].unsqueeze(0)  # 1 H W
-
         if self.is_padding:
             shape_mask = torch.zeros_like(gt_img)
             shape_mask[:, :tp_shape[0], :tp_shape[1]] = 1
             data_dict['shape_mask'] = shape_mask        # 1 H W
-
         return data_dict
 
     def _process_video(self, sample: Dict) -> Dict[str, Any]:
         """Load a video clip sample (T = clip_len) with frame-consistent augmentation."""
         clip_paths = sample['clip_paths']
         mask_paths = sample['mask_paths']
-
         imgs = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in clip_paths]
         ms = []
         for i, m in enumerate(mask_paths):
@@ -428,11 +419,8 @@ class MixedImageVideoDataset(Dataset):
             else:
                 h, w = imgs[i].shape[:2]
                 ms.append(np.zeros((h, w), dtype=np.float32))
-
         tp_shape = imgs[0].shape[:2] if self.is_padding else self.output_size
-
         original_edge_masks = [np.zeros_like(mask) for mask in ms] if self.edge_mask_generator is not None else None
-
         # Step 1: frame-consistent data augmentation (ReplayCompose).
         if self.video_data_transform is not None:
             aug = self.video_data_transform(image=imgs[0], mask=ms[0])
@@ -448,13 +436,11 @@ class MixedImageVideoDataset(Dataset):
         else:
             data_aug_imgs, data_aug_masks = imgs, ms
             data_aug_edges = original_edge_masks if self.edge_mask_generator is not None else None
-
         # Step 2: before transform (resize / pad).
         before_trans_imgs = [self.video_before_trans(image=img)['image'] for img in data_aug_imgs]
         before_trans_masks = [self.video_before_trans(image=mask)['image'] for mask in data_aug_masks]
         if self.edge_mask_generator is not None:
             before_trans_edges = [self.video_before_trans(image=edge)['image'] for edge in data_aug_edges]
-
         # Step 3: base transform (normalize + to-tensor).
         transformed_imgs, transformed_masks, transformed_edges = [], [], []
         for i, (img, mask) in enumerate(zip(before_trans_imgs, before_trans_masks)):
@@ -464,7 +450,6 @@ class MixedImageVideoDataset(Dataset):
             if self.edge_mask_generator is not None:
                 base_edge = self.video_base_transform(image=img, mask=before_trans_edges[i])['mask']
                 transformed_edges.append(base_edge.float().unsqueeze(0))
-
         mask_tensors = []
         for mask in transformed_masks:
             if not isinstance(mask, torch.Tensor):
@@ -473,11 +458,9 @@ class MixedImageVideoDataset(Dataset):
             if mask.dim() == 2:
                 mask = mask.unsqueeze(0)
             mask_tensors.append(mask)
-
         labels = [0 if torch.sum(mask) == 0 else 1 for mask in mask_tensors]
         video_name = (os.path.basename(os.path.dirname(clip_paths[0]))
                       + os.path.basename(clip_paths[0]).split('.')[0])
-
         # Per-frame tensors live in (T, *) layout; collate_fn handles per-sample T.
         data_dict = {
             'image': torch.stack(transformed_imgs, dim=0),   # T C H W
@@ -489,29 +472,28 @@ class MixedImageVideoDataset(Dataset):
             'name': video_name,
             '_T': self.clip_len,
         }
-
         if self.edge_mask_generator is not None:
             data_dict['edge_mask'] = torch.stack(transformed_edges, dim=0)  # T 1 H W
-
         if self.is_padding:
             shape_mask = torch.zeros_like(mask_tensors[0])
             shape_mask[:, :tp_shape[0], :tp_shape[1]] = 1
             T = len(transformed_imgs)
             data_dict['shape_mask'] = shape_mask.unsqueeze(0).repeat(T, 1, 1, 1)
-
         return data_dict
-
     # --------------------------------------------------------------- sampling
+
     def _setup_sampling(self):
         num_image_datasets = len(self.image_datasets_samples)
         num_video_datasets = len(self.video_datasets_samples)
         if num_image_datasets == 0 and num_video_datasets == 0:
             raise ValueError("No datasets found")
-
         total_image_samples = sum(len(s) for s in self.image_datasets_samples)
         total_video_samples = sum(len(s) for s in self.video_datasets_samples)
-        self._len = total_image_samples + total_video_samples
-
+        if self._pure_video_train:
+            # Here total_video_samples is the number of source videos (method/video pairs).
+            self._len = total_video_samples * self.video_train_repeat
+        else:
+            self._len = total_image_samples + total_video_samples
         if self.split == 'train':
             # Flatten (type, dataset_idx, sample_idx). The DataLoader sampler owns shuffling,
             # matching IMDLBenCo's dataset behavior and keeping DDP epochs reproducible.
@@ -520,14 +502,43 @@ class MixedImageVideoDataset(Dataset):
                 for i in range(len(dataset_samples)):
                     self.all_samples_indices.append(('image', dataset_idx, i))
             for dataset_idx, dataset_samples in enumerate(self.video_datasets_samples):
-                for i in range(len(dataset_samples)):
-                    self.all_samples_indices.append(('video', dataset_idx, i))
+                repeat = self.video_train_repeat if self._pure_video_train else 1
+                for _ in range(repeat):
+                    for i in range(len(dataset_samples)):
+                        self.all_samples_indices.append(('video', dataset_idx, i))
             print("Training mode sampling setup:")
             print(f"  Image datasets: {num_image_datasets}, total samples: {total_image_samples}")
             print(f"  Video datasets: {num_video_datasets}, total samples: {total_video_samples}")
+            if self._pure_video_train:
+                print(f"  Pure-video random clip repeat: {self.video_train_repeat}x per source video")
             print(f"  Total samples per epoch: {self._len}")
         else:
             print(f"Test mode: using all {self._len} samples")
+
+    def _sample_random_clip(self, sample: Dict) -> Dict[str, Any]:
+        """Build one random contiguous clip from a stored source-video item."""
+        if sample.get('mode') != 'video':
+            return sample
+        frames = sample['frames']
+        max_start = len(frames) - self.clip_len
+        start = int(np.random.randint(0, max_start + 1))
+        clip = frames[start:start + self.clip_len]
+        video_path = sample['dataset_path']
+        video = sample['video']
+        method = sample['method']
+        datatype = sample['dataset_type']
+        if datatype == 'MOSE':
+            masks = [os.path.join(video_path, method, sample['mask_name'], video, os.path.basename(f))
+                     for f in clip]
+        elif datatype == 'Splice':
+            masks = [os.path.join(video_path, method, sample['mask_name'], video,
+                                  'mask_' + os.path.basename(f))
+                     for f in clip]
+        else:
+            masks = [os.path.join(video_path, 'mask', video, os.path.basename(f)) for f in clip]
+        out = dict(sample)
+        out.update({'mode': 'clip', 'clip_paths': clip, 'mask_paths': masks})
+        return out
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         if self.split == 'train':
@@ -552,12 +563,12 @@ class MixedImageVideoDataset(Dataset):
                     current_index += len(dataset_samples)
             if sample is None:
                 raise IndexError(f"Index {index} out of range")
-
         if sample['type'] == 'image':
             data_dict = self._process_image_as_video(sample)
         else:
+            if self._pure_video_train:
+                sample = self._sample_random_clip(sample)
             data_dict = self._process_video(sample)
-
         if self.post_funcs is not None:
             if isinstance(self.post_funcs, list):
                 for func in self.post_funcs:
@@ -569,20 +580,17 @@ class MixedImageVideoDataset(Dataset):
                 self.post_funcs(data_dict)
             else:
                 raise NotImplementedError(f"Unsupported type: {type(self.post_funcs)}")
-
         return data_dict
-
     @staticmethod
+
     def collate_fn(batch):
         """
         Flatten variable-length clips (image -> T=1, video -> T=clip_len) into a single
         frame batch.  Per-sample items returned by `_process_image_as_video` are 3D
         ((C,H,W) / (1,H,W)); video items are 4D ((T,C,H,W)).
-
         Fast path: when every sample is a single image, use torch.stack (avoids the
         ~36% extra cost of cat-with-3D-tensors via Python list iteration).  Mixed or
         pure-video batches fall back to the general per-sample unsqueeze+cat path.
-
         Returns a dict with:
           - image        : (sum_T, C, H, W) flattened frames
           - mask         : (sum_T, 1, H, W)
@@ -592,7 +600,6 @@ class MixedImageVideoDataset(Dataset):
         """
         first = batch[0]
         all_image = all(s.get('_T', 1) == 1 for s in batch)
-
         if all_image:
             # 3D per-sample tensors -> single stack call per modality.
             image = torch.stack([s['image'] for s in batch], dim=0)
@@ -609,11 +616,9 @@ class MixedImageVideoDataset(Dataset):
             if 'shape_mask' in first:
                 result['shape_mask'] = torch.stack([s['shape_mask'] for s in batch], dim=0)
             return result
-
         # Mixed image+video batch: promote 3D samples to 4D (T=1) then cat along T.
         def _as_T(t):
             return t.unsqueeze(0) if t.dim() == 3 else t
-
         image_cat = torch.cat([_as_T(s['image']) for s in batch], dim=0)
         mask_cat  = torch.cat([_as_T(s['mask'])  for s in batch], dim=0)
         result = {
@@ -658,7 +663,6 @@ def split_dataset_config(config: List[List]) -> Tuple[List[List], List[List]]:
 def build_dataset_from_config(config, split: str = 'train', **kwargs) -> MixedImageVideoDataset:
     """
     Build a MixedImageVideoDataset from a config (path to JSON file or already-parsed list).
-
     The same helper produces image-only, video-only, or mixed datasets depending on the
     entries present in `config`.
     """
